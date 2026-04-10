@@ -60,24 +60,37 @@ ntn-cho-framework/
 
 ## Installation
 
-### Prerequisites
-
-Clone the NTN simulation platform first:
+### Step 1: Clone the NTN Simulation Platform
 
 ```bash
 git clone https://github.com/Muhammaduazir69/ns3-ntn-toolkit.git
 cd ns3-ntn-toolkit
 ```
 
-### Add NTN-CHO Module
+### Step 2: Clone the SNS3 Satellite Module (REQUIRED)
+
+The satellite module is **mandatory** for this framework. It provides SGP4 orbit propagation, antenna gain patterns, and constellation data used by the NTN-CHO core:
 
 ```bash
 cd contrib/
+git clone https://github.com/sns3/sns3-satellite.git satellite
+```
+
+### Step 3: Clone the NTN-CHO Module
+
+```bash
 git clone https://github.com/Muhammaduazir69/ntn-cho-framework.git ntn-cho
 cd ..
-./ns3 configure --enable-examples --enable-tests
-./ns3 build ntn-cho
 ```
+
+### Step 4: Build
+
+```bash
+./ns3 configure --enable-examples --enable-tests
+./ns3 build
+```
+
+> **Important**: If you skip the satellite module, the build will fail. The NTN-CHO framework depends on `SatMobilityModel`, `SatAntennaGainPatternContainer`, and `GeoCoordinate` classes from the satellite module.
 
 ### Run Simulation
 
