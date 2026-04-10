@@ -1,0 +1,11 @@
+build/
+*.o
+*.so
+*.pyc
+__pycache__/
+node_modules/
+package-lock.json
+.vscode/
+.idea/
+*.swp
+.DS_Store

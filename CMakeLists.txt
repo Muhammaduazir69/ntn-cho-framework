@@ -1,0 +1,38 @@
+set(source_files
+    model/ntn-orbit-predictor.cc
+    model/ntn-tte-estimator.cc
+    model/ntn-cho-algorithm.cc
+    model/ntn-measurement-model.cc
+    helper/ntn-cho-helper.cc
+)
+
+set(header_files
+    model/ntn-orbit-predictor.h
+    model/ntn-tte-estimator.h
+    model/ntn-cho-algorithm.h
+    model/ntn-measurement-model.h
+    helper/ntn-cho-helper.h
+)
+
+set(test_sources
+    test/ntn-cho-test-suite.cc
+)
+
+build_lib(
+  LIBNAME ntn-cho
+  SOURCE_FILES ${source_files}
+  HEADER_FILES ${header_files}
+  LIBRARIES_TO_LINK
+    ${libcore}
+    ${libnetwork}
+    ${libmobility}
+    ${libpropagation}
+    ${libspectrum}
+    ${liblte}
+    ${libmmwave}
+    ${libsatellite}
+    ${libinternet}
+    ${libapplications}
+    ${libpoint-to-point}
+  TEST_SOURCES ${test_sources}
+)

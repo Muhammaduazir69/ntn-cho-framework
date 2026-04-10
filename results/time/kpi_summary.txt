@@ -1,0 +1,13 @@
+=== NTN-CHO KPI Summary ===
+Trigger Type: time
+D1 Threshold: 50000 m
+Quality Threshold: -5 dB
+TTE Minimum: 20 s
+
+Total Handovers:     661
+Successful HOs:      411
+Failed HOs:          250
+Ping-Pong Events:    0
+HO Success Rate:     62.18 %
+HO Failure Rate:     37.82 %
+Ping-Pong Rate:      0.00 %
