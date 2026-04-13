@@ -3,6 +3,7 @@ set(source_files
     model/ntn-tte-estimator.cc
     model/ntn-cho-algorithm.cc
     model/ntn-measurement-model.cc
+    model/ntn-ai-interface.cc
     helper/ntn-cho-helper.cc
 )
 
@@ -11,6 +12,7 @@ set(header_files
     model/ntn-tte-estimator.h
     model/ntn-cho-algorithm.h
     model/ntn-measurement-model.h
+    model/ntn-ai-interface.h
     helper/ntn-cho-helper.h
 )
 
@@ -34,5 +36,6 @@ build_lib(
     ${libinternet}
     ${libapplications}
     ${libpoint-to-point}
+    ${libai}
   TEST_SOURCES ${test_sources}
 )
