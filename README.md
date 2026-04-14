@@ -247,6 +247,18 @@ reward = +1 (success) + SINR_improvement × 0.5 + min(ToS/30, 3)
 - TR 38.821: Solutions for NR to support NTN (mobility, timing)
 - TS 38.133: RRM requirements for NTN
 
+## Related Projects
+
+This framework is part of a larger 6G NTN simulation ecosystem:
+
+| Project | Description |
+|---------|-------------|
+| **[ns3-ntn-toolkit](https://github.com/Muhammaduazir69/ns3-ntn-toolkit)** | Pre-integrated ns-3.43 platform with mmWave, SNS3 satellite, 3GPP NTN channels, ns3-ai, and patched LTE for dual connectivity |
+| **[oran-ntn](https://github.com/Muhammaduazir69/oran-ntn)** | Complete Space-O-RAN architecture: Near-RT/Non-RT/Space RIC, 9 xApps (including AI-driven HO prediction using this framework's TTE algorithm), federated learning, ISL coordination, mmWave NTN PHY (27,000+ LOC) |
+| **[ns3-ai](https://github.com/Muhammaduazir69/ns3-ai)** | Modernized ns3-ai fork for ns-3.43+ with LTO/pybind11 fixes, NumPy 2.0+, Python 3.13+, Gymnasium 1.0+ API |
+
+The **oran-ntn** module's HO Prediction xApp directly builds on this framework's TTE-aware algorithm, extending it with O-RAN E2/A1 interfaces, multi-xApp conflict resolution, and Gymnasium RL training environments.
+
 ## Citation
 
 ```bibtex
