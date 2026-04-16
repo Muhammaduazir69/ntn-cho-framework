@@ -6,6 +6,10 @@
 [![License: GPL v2](https://img.shields.io/badge/License-GPL_v2-blue.svg)](https://www.gnu.org/licenses/old-licenses/gpl-2.0.en.html)
 [![Platform](https://img.shields.io/badge/Platform-Linux-green.svg)]()
 
+<p align="center">
+  <img src="visualization/ntn_cho_handover_animation.gif" alt="TTE-Aware Handover Animation" width="800"/>
+</p>
+
 ---
 
 ## Overview
@@ -24,6 +28,20 @@ The TTE-aware algorithm predicts beam coverage duration using ephemeris-based or
 | Time-Based CHO | 661 | 62.2% | 37.8% | 0.0% |
 
 The proposed TTE-aware CHO achieves **zero ping-pong** (vs 55% for A3/Location baselines) while maintaining high success rates, with the fewest total handovers (245 vs 945 for A3).
+
+<p align="center">
+  <img src="visualization/ntn_cho_algorithm_comparison.gif" alt="4-Algorithm Comparison" width="800"/>
+</p>
+
+<p align="center">
+  <img src="visualization/ntn_cho_results_comparison.png" alt="Results Comparison" width="700"/>
+</p>
+
+### TTE Prediction Accuracy
+
+<p align="center">
+  <img src="visualization/ntn_cho_tte_accuracy.png" alt="TTE Accuracy" width="700"/>
+</p>
 
 ---
 
