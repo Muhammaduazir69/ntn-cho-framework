@@ -273,9 +273,12 @@ This framework is part of a larger 6G NTN simulation ecosystem:
 |---------|-------------|
 | **[ns3-ntn-toolkit](https://github.com/Muhammaduazir69/ns3-ntn-toolkit)** | Pre-integrated ns-3.43 platform with mmWave, SNS3 satellite, 3GPP NTN channels, ns3-ai, and patched LTE for dual connectivity |
 | **[oran-ntn](https://github.com/Muhammaduazir69/oran-ntn)** | Complete Space-O-RAN architecture: Near-RT/Non-RT/Space RIC, 9 xApps (including AI-driven HO prediction using this framework's TTE algorithm), federated learning, ISL coordination, mmWave NTN PHY (27,000+ LOC) |
+| **[ns3-thz-ntn](https://github.com/Muhammaduazir69/ns3-thz-ntn)** | THz (100 GHz - 10 THz) extension: HITRAN molecular absorption, UM-MIMO, beam tracking, ISL, RIS, ISAC, O-RAN integration, 5 waveforms (OTFS/AFDM/...). Adds **`TRIGGER_THZ_BEAM_QUALITY`** to this framework's CHO state machine and **`ComputeThzBeamTte()`** to the TTE estimator for THz pencil beams |
 | **[ns3-ai](https://github.com/Muhammaduazir69/ns3-ai)** | Modernized ns3-ai fork for ns-3.43+ with LTO/pybind11 fixes, NumPy 2.0+, Python 3.13+, Gymnasium 1.0+ API |
 
 The **oran-ntn** module's HO Prediction xApp directly builds on this framework's TTE-aware algorithm, extending it with O-RAN E2/A1 interfaces, multi-xApp conflict resolution, and Gymnasium RL training environments.
+
+The **ns3-thz-ntn** module adds a new CHO trigger type (`TRIGGER_THZ_BEAM_QUALITY`) and a THz-specific TTE estimator (`ComputeThzBeamTte()`) that accounts for the much smaller THz pencil-beam footprint (seconds-scale coverage vs minutes for Ka-band). Multi-band CHO preparation (Ka primary + THz candidate) is supported via the `EnableMultiBandCho` attribute.
 
 ## Citation
 
