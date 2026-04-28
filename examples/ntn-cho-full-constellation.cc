@@ -24,6 +24,7 @@
 #include "ns3/ntn-cho-algorithm.h"
 #include "ns3/ntn-cho-helper.h"
 #include "ns3/ntn-measurement-model.h"
+#include "ns3/ntn-realistic-mobility.h"
 
 #include <cmath>
 #include <fstream>
@@ -106,7 +107,7 @@ double computeElevation(double ueLat, double ueLon, double satLat, double satLon
     double gamma = 2.0 * std::atan2(std::sqrt(a), std::sqrt(1-a));
 
     double groundDist = R * gamma;
-    double slantRange = std::sqrt(groundDist * groundDist + satAlt * satAlt +
+    [[maybe_unused]] double slantRange = std::sqrt(groundDist * groundDist + satAlt * satAlt +
                         2 * R * satAlt * (1 - std::cos(gamma)) - 2 * groundDist * satAlt * std::cos(gamma));
 
     // Elevation: sin(el) = (R+h)*cos(gamma) - R) / slantRange
@@ -272,22 +273,27 @@ int main(int argc, char* argv[])
               << "  SimTime:       " << simTime << " s\n"
               << "============================================\n";
 
-    // ============= Create UEs =============
+    // ============= Create UEs (3GPP TR 38.811 §6.1.1.1 mobility classes) =============
+    // Use NtnRealisticMobilityHelper so each UE gets a class-appropriate
+    // motion rule (static / pedestrian / vehicular / HST / maritime /
+    // aviation / IoT) with speeds + headings sourced from 3GPP and IMO/ICAO.
+    NtnRealisticMobilityHelper mobilityHelper(static_cast<uint64_t>(rngRun));
+    auto profile = NtnMobilityScenarios::MixedContinental();
+    auto realisticUes = mobilityHelper.GenerateUes(numUes, profile,
+                                                    /*minLat=*/25.0,
+                                                    /*maxLat=*/65.0,
+                                                    /*minLon=*/-20.0,
+                                                    /*maxLon=*/40.0);
+
     std::vector<UeState> ues(numUes);
     for (uint32_t i = 0; i < numUes; i++) {
+        const auto& src = realisticUes[i];
         ues[i].id = i;
-        ues[i].lat = 25.0 + uniDist(rng) * 40.0;  // 25-65 deg (under orbit ground track)
-        ues[i].lon = -20.0 + uniDist(rng) * 60.0;  // -20 to 40 deg
-        double mobRand = uniDist(rng);
-        if (mobRand < 0.3) { ues[i].mobilityType = "static"; ues[i].vNorth = 0; ues[i].vEast = 0; }
-        else if (mobRand < 0.5) { ues[i].mobilityType = "pedestrian"; ues[i].vNorth = 1.2*normDist(rng); ues[i].vEast = 1.2*normDist(rng); }
-        else if (mobRand < 0.9) {
-            ues[i].mobilityType = "vehicular";
-            double speed = 20.0 + uniDist(rng) * 20.0;
-            double angle = uniDist(rng) * 2 * M_PI;
-            ues[i].vNorth = speed * std::cos(angle);
-            ues[i].vEast = speed * std::sin(angle);
-        } else { ues[i].mobilityType = "hst"; ues[i].vNorth = 80.0 + normDist(rng)*5; ues[i].vEast = 20.0 + normDist(rng)*5; }
+        ues[i].lat = src.lat;
+        ues[i].lon = src.lon;
+        ues[i].vNorth = src.vNorth;
+        ues[i].vEast  = src.vEast;
+        ues[i].mobilityType = src.className;
         ues[i].servingSatId = UINT32_MAX;
         ues[i].servingCellId = 0;
         ues[i].servingSinr = -100;
@@ -396,10 +402,16 @@ int main(int argc, char* argv[])
 
         // --- Per-UE processing ---
         double sumSinr = 0;
-        for (auto& ue : ues) {
-            // Move UE
-            ue.lat += ue.vNorth * dt / 111320.0;
-            ue.lon += ue.vEast * dt / (111320.0 * std::max(std::cos(ue.lat * M_PI / 180), 0.01));
+        for (size_t ueIdx = 0; ueIdx < ues.size(); ueIdx++) {
+            auto& ue = ues[ueIdx];
+            auto& realisticUe = realisticUes[ueIdx];
+            // Class-aware motion (random-walk, Gauss-Markov heading,
+            // waypoint, or stationary depending on UE class).
+            mobilityHelper.AdvanceUe(realisticUe, dt);
+            ue.lat = realisticUe.lat;
+            ue.lon = realisticUe.lon;
+            ue.vNorth = realisticUe.vNorth;
+            ue.vEast  = realisticUe.vEast;
 
             // Measure all visible satellites
             struct SatMeas { uint32_t satId; double sinr, rsrp, gain, elev, range, doppler, loss, delay; };

@@ -50,6 +50,7 @@ class NtnOrbitPredictor : public Object
         uint32_t satId;              //!< Satellite identifier
         uint32_t beamId;             //!< Beam identifier within satellite
         GeoCoordinate beamCenter;    //!< Beam center ground position
+        GeoCoordinate satellitePosition; //!< Satellite ECEF/geodetic position
         double gainAtUe_dB;          //!< Antenna gain at UE position (dB)
         double elevationAngle_deg;   //!< Satellite elevation angle from UE (deg)
         double slantRange_km;        //!< Distance from UE to satellite (km)

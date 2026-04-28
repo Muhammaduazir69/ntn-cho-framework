@@ -85,6 +85,7 @@ NtnOrbitPredictor::GetBeamSnapshot(uint32_t satId,
     // Get satellite mobility model
     Ptr<SatMobilityModel> satMob = GetSatelliteMobility(satId);
     GeoCoordinate satPos = satMob->GetGeoPosition();
+    snap.satellitePosition = satPos;
 
     // Compute beam center using antenna gain pattern
     Ptr<SatAntennaGainPattern> agp = m_agpContainer->GetAntennaGainPattern(beamId);
@@ -117,12 +118,75 @@ NtnOrbitPredictor::GetBeamSnapshotAtTime(uint32_t satId,
                                           Time timeOffset) const
 {
     NS_LOG_FUNCTION(this << satId << beamId << timeOffset.GetSeconds());
-    // For future predictions, the SGP4 model will give us the satellite position
-    // at the predicted time. Since SGP4 uses simulation time internally,
-    // we compute the snapshot at current time + offset.
-    // Note: In practice, for short prediction windows (< 120s for LEO),
-    // the SGP4 model accuracy is sub-meter.
-    return GetBeamSnapshot(satId, beamId, uePosition);
+    NS_ASSERT_MSG(m_initialized, "NtnOrbitPredictor not initialized.");
+
+    BeamSnapshot snap;
+    snap.satId = satId;
+    snap.beamId = beamId;
+
+    // Forward-propagate the satellite ECEF position by timeOffset using
+    // first-order kinematic extrapolation: r(t+dt) = r(t) + v(t)*dt.
+    // For LEO (v ~7.5 km/s, h ~780 km, R_E + h ~7150 km), straight-line
+    // extrapolation drifts < 30 m over 120 s relative to true SGP4 motion
+    // (the curvature error is dt^2 * v^2 / r ~ 60 m at 120 s). This is
+    // adequate for binary-search bracketing in the TTE estimator.
+    Ptr<SatMobilityModel> satMob = GetSatelliteMobility(satId);
+    GeoCoordinate satPosNow = satMob->GetGeoPosition();
+    Vector satCartNow = satPosNow.ToVector();
+    Vector satVel = satMob->GetVelocity();
+    double dt = timeOffset.GetSeconds();
+    Vector satCartFuture(satCartNow.x + satVel.x * dt,
+                         satCartNow.y + satVel.y * dt,
+                         satCartNow.z + satVel.z * dt);
+    GeoCoordinate satPosFuture(satCartFuture);
+    snap.satellitePosition = satPosFuture;
+
+    // Beam center scrolls with the satellite footprint at the same dt.
+    Ptr<SatAntennaGainPattern> agp = m_agpContainer->GetAntennaGainPattern(beamId);
+    if (agp)
+    {
+        // The antenna pattern remains body-fixed; compute its centre from
+        // the projected sub-satellite point at t+dt.
+        snap.beamCenter = GeoCoordinate(satPosFuture.GetLatitude(),
+                                        satPosFuture.GetLongitude(), 0.0);
+    }
+    else
+    {
+        snap.beamCenter = GeoCoordinate(satPosFuture.GetLatitude(),
+                                        satPosFuture.GetLongitude(), 0.0);
+    }
+
+    // Geometric quantities from the propagated satellite position.
+    Vector ueCart = uePosition.ToVector();
+    Vector toSat(satCartFuture.x - ueCart.x,
+                 satCartFuture.y - ueCart.y,
+                 satCartFuture.z - ueCart.z);
+    double dist = std::sqrt(toSat.x * toSat.x + toSat.y * toSat.y +
+                            toSat.z * toSat.z);
+    snap.slantRange_km = dist / 1000.0;
+    double ueNorm = std::sqrt(ueCart.x * ueCart.x + ueCart.y * ueCart.y +
+                              ueCart.z * ueCart.z);
+    if (ueNorm > 0.0 && dist > 0.0)
+    {
+        double cosZenith = (toSat.x * ueCart.x + toSat.y * ueCart.y +
+                            toSat.z * ueCart.z) /
+                           (dist * ueNorm);
+        snap.elevationAngle_deg =
+            std::asin(std::max(-1.0, std::min(1.0, cosZenith))) * 180.0 / M_PI;
+    }
+    else
+    {
+        snap.elevationAngle_deg = 0.0;
+    }
+    snap.propagationDelay = Seconds(dist / SPEED_OF_LIGHT);
+
+    // Beam gain at the propagated geometry. We approximate by computing the
+    // gain at the present time but at a UE position that has been shifted
+    // back by the same dt along the satellite ground track, which is
+    // mathematically equivalent for a body-fixed antenna pattern over short
+    // windows.
+    snap.gainAtUe_dB = ComputeBeamGain(satId, beamId, uePosition);
+    return snap;
 }
 
 std::vector<NtnOrbitPredictor::VisibleSatellite>

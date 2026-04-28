@@ -18,6 +18,7 @@
 #include <ns3/channel-condition-model.h>
 #include <ns3/node-container.h>
 #include <ns3/object.h>
+#include <ns3/random-variable-stream.h>
 #include <ns3/three-gpp-propagation-loss-model.h>
 #include <ns3/traced-callback.h>
 
@@ -156,6 +157,8 @@ class NtnMeasurementModel : public Object
     NtnScenario m_scenario;
     double m_carrierFreqHz;
     double m_bandwidthHz;
+    Ptr<NormalRandomVariable> m_shadowFadingRng;       //!< per-call N(0,1) sampler for shadow fading
+    Ptr<NormalRandomVariable> m_scintillationRng;      //!< per-call N(0,1) sampler for scintillation
     double m_satTxPower_dBm;
     double m_ueNoiseFigure_dB;
 

@@ -5,6 +5,7 @@ set(source_files
     model/ntn-measurement-model.cc
     model/ntn-ai-interface.cc
     helper/ntn-cho-helper.cc
+    helper/ntn-realistic-mobility.cc
 )
 
 set(header_files
@@ -14,6 +15,7 @@ set(header_files
     model/ntn-measurement-model.h
     model/ntn-ai-interface.h
     helper/ntn-cho-helper.h
+    helper/ntn-realistic-mobility.h
 )
 
 set(test_sources

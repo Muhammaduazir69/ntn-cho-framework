@@ -17,3 +17,11 @@ build_lib_example(
     ${libnetwork}
     ${libmobility}
 )
+
+build_lib_example(
+  NAME ntn-realistic-mobility-demo
+  SOURCE_FILES ntn-realistic-mobility-demo.cc
+  LIBRARIES_TO_LINK
+    ${libntn-cho}
+    ${libcore}
+)
