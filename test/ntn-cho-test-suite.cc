@@ -137,7 +137,7 @@ class NtnMeasurementModelTestCase : public TestCase
 {
   public:
     NtnMeasurementModelTestCase()
-        : TestCase("NTN Measurement Model - RSRP/SINR computation")
+        : TestCase("NTN Measurement Model - RSRP SINR computation")
     {
     }
 

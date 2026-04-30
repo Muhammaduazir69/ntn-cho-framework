@@ -196,6 +196,34 @@ class NtnTteEstimator : public Object
                                     Vector velocity,
                                     Time dt) const;
 
+    /**
+     * \brief Compute TTE for a THz narrow beam based on geometric coverage
+     *
+     * \param satAlt_km Satellite altitude in km
+     * \param satVelocity_km_s Satellite orbital velocity in km/s
+     * \param beamwidth_deg THz beam 3dB beamwidth in degrees
+     * \param pointingError_deg Current pointing error in degrees
+     * \param elevationDeg Elevation angle from UE to satellite in degrees
+     * \return TTE in seconds
+     */
+    double ComputeThzBeamTte(double satAlt_km,
+                              double satVelocity_km_s,
+                              double beamwidth_deg,
+                              double pointingError_deg,
+                              double elevationDeg) const;
+
+    /**
+     * \brief Compute effective THz beam coverage diameter on ground
+     *
+     * \param satAlt_km Satellite altitude in km
+     * \param beamwidth_deg THz beam 3dB beamwidth in degrees
+     * \param pointingError_deg Current pointing error in degrees
+     * \return Effective coverage diameter in km
+     */
+    double ComputeThzEffectiveCoverage_km(double satAlt_km,
+                                           double beamwidth_deg,
+                                           double pointingError_deg) const;
+
     Ptr<NtnOrbitPredictor> m_orbitPredictor;   //!< Orbit prediction engine
     Time m_predictionStep;                      //!< Coarse search step (default 1s)
     Time m_maxPredictionWindow;                 //!< Max look-ahead window (default 120s)

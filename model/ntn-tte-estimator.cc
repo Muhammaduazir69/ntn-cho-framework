@@ -386,4 +386,73 @@ NtnTteEstimator::ProjectUePosition(GeoCoordinate uePos, Vector velocity, Time dt
                          uePos.GetAltitude());
 }
 
+double
+NtnTteEstimator::ComputeThzBeamTte(double satAlt_km,
+                                    double satVelocity_km_s,
+                                    double beamwidth_deg,
+                                    double pointingError_deg,
+                                    double elevationDeg) const
+{
+    NS_LOG_FUNCTION(this << satAlt_km << satVelocity_km_s << beamwidth_deg
+                         << pointingError_deg << elevationDeg);
+
+    // Effective coverage diameter accounting for pointing error
+    double effectiveDiameter_km = ComputeThzEffectiveCoverage_km(
+        satAlt_km, beamwidth_deg, pointingError_deg);
+
+    if (effectiveDiameter_km <= 0.0)
+    {
+        NS_LOG_DEBUG("THz effective coverage is zero, TTE=0");
+        return 0.0;
+    }
+
+    // Ground track velocity component
+    // elevation_from_nadir = 90 - elevationDeg
+    double nadirAngleRad = (90.0 - elevationDeg) * M_PI / 180.0;
+    double groundTrackVelocity_km_s = satVelocity_km_s * std::cos(nadirAngleRad);
+
+    if (groundTrackVelocity_km_s <= 0.0)
+    {
+        NS_LOG_DEBUG("Ground track velocity is zero, TTE=maxWindow");
+        return m_maxPredictionWindow.GetSeconds();
+    }
+
+    double tte_s = effectiveDiameter_km / groundTrackVelocity_km_s;
+
+    NS_LOG_INFO("THz beam TTE: alt=" << satAlt_km << " km, beamwidth=" << beamwidth_deg
+                << " deg, pointErr=" << pointingError_deg << " deg, elev=" << elevationDeg
+                << " deg -> coverage=" << effectiveDiameter_km << " km, v_ground="
+                << groundTrackVelocity_km_s << " km/s, TTE=" << tte_s << " s");
+    return tte_s;
+}
+
+double
+NtnTteEstimator::ComputeThzEffectiveCoverage_km(double satAlt_km,
+                                                  double beamwidth_deg,
+                                                  double pointingError_deg) const
+{
+    NS_LOG_FUNCTION(this << satAlt_km << beamwidth_deg << pointingError_deg);
+
+    static constexpr double DEG_TO_RAD = M_PI / 180.0;
+
+    // Coverage radius = altitude * tan(beamwidth/2)
+    double halfBeamRad = (beamwidth_deg / 2.0) * DEG_TO_RAD;
+    double radius_km = satAlt_km * std::tan(halfBeamRad);
+
+    // Reduce by pointing error factor
+    double errorFactor = 1.0 - pointingError_deg / beamwidth_deg;
+    if (errorFactor < 0.0)
+    {
+        errorFactor = 0.0;
+    }
+
+    double effectiveRadius_km = radius_km * errorFactor;
+    double effectiveDiameter_km = 2.0 * effectiveRadius_km;
+
+    NS_LOG_DEBUG("THz effective coverage: radius=" << radius_km << " km"
+                 << ", errorFactor=" << errorFactor
+                 << ", effective diameter=" << effectiveDiameter_km << " km");
+    return effectiveDiameter_km;
+}
+
 } // namespace ns3

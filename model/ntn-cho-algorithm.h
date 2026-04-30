@@ -67,7 +67,8 @@ class NtnChoAlgorithm : public Object
         TRIGGER_EVENT_A3,          //!< Traditional RSRP offset trigger
         TRIGGER_LOCATION_D1,       //!< 3GPP condEventD1: distance to beam center
         TRIGGER_TIME_BASED,        //!< Timer-based beam dwell trigger
-        TRIGGER_TTE_AWARE          //!< NOVEL: TTE + location + quality
+        TRIGGER_TTE_AWARE,         //!< NOVEL: TTE + location + quality
+        TRIGGER_THZ_BEAM_QUALITY   //!< Handover when THz beam tracking error exceeds threshold
     };
 
     /**
@@ -292,6 +293,33 @@ class NtnChoAlgorithm : public Object
 
     HandoverExecutionCallback m_hoCallback;
     CandidateAdmittedCallback m_admitCallback;
+
+    /**
+     * \brief Evaluate THz beam quality for a candidate
+     * \param candidateIdx Cell ID of the candidate
+     * \return true if pointing error and THz SNR are within thresholds
+     */
+    bool EvaluateThzBeamQuality(uint32_t candidateIdx) const;
+
+    /**
+     * \brief Compute TTE for a THz narrow beam
+     * \param candidateIdx Cell ID of the candidate
+     * \return TTE in seconds based on THz beam footprint
+     */
+    double ComputeThzBeamTte(uint32_t candidateIdx) const;
+
+    /**
+     * \brief Prepare multi-band (Ka + THz) candidate sets
+     *
+     * For each candidate, evaluate both Ka-band and THz quality.
+     * THz is used as primary when available, Ka-band as fallback.
+     */
+    void PrepareMultiBandCandidates();
+
+    double m_thzBeamTrackingThreshold_deg; //!< Max pointing error before HO trigger (default 0.3 deg)
+    double m_thzSnrThreshold_dB;           //!< Min THz SNR for candidate admission (default 0 dB)
+    bool m_enableMultiBandCho;             //!< Enable Ka+THz dual candidate sets
+    double m_thzBeamwidth_deg;             //!< THz beam 3dB beamwidth for TTE calc (default 0.5 deg)
 
     static constexpr uint16_t INVALID_CELL_ID = 0;
 };

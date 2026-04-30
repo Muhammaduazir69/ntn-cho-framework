@@ -38,6 +38,6 @@ build_lib(
     ${libinternet}
     ${libapplications}
     ${libpoint-to-point}
-    ${libai}
+    ${libns3-ai-ntn}
   TEST_SOURCES ${test_sources}
 )

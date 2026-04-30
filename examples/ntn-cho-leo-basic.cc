@@ -150,7 +150,7 @@ main(int argc, char* argv[])
 
     // ========== Print KPI structure ==========
     std::cout << "\n--- KPI Collection Framework ---" << std::endl;
-    NtnChoHelper::KpiResults kpis = ntnHelper->GetKpiResults();
+    [[maybe_unused]] NtnChoHelper::KpiResults kpis = ntnHelper->GetKpiResults();
     std::cout << "KPI tracking initialized." << std::endl;
     std::cout << "Available metrics:" << std::endl;
     std::cout << "  - HO success/failure/ping-pong rates" << std::endl;
