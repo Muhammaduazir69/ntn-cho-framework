@@ -6,6 +6,9 @@ build_lib_example(
     ${libcore}
     ${libnetwork}
     ${libmobility}
+    ${libinternet}
+    ${libapplications}
+    ${libpoint-to-point}
 )
 
 build_lib_example(
@@ -16,6 +19,9 @@ build_lib_example(
     ${libcore}
     ${libnetwork}
     ${libmobility}
+    ${libinternet}
+    ${libapplications}
+    ${libpoint-to-point}
 )
 
 build_lib_example(

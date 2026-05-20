@@ -6,6 +6,7 @@ set(source_files
     model/ntn-ai-interface.cc
     helper/ntn-cho-helper.cc
     helper/ntn-realistic-mobility.cc
+    helper/ntn-realistic-traffic-helper.cc
 )
 
 set(header_files
@@ -16,6 +17,7 @@ set(header_files
     model/ntn-ai-interface.h
     helper/ntn-cho-helper.h
     helper/ntn-realistic-mobility.h
+    helper/ntn-realistic-traffic-helper.h
 )
 
 set(test_sources
