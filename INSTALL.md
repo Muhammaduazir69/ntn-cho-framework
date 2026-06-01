@@ -36,7 +36,8 @@ manually apply the dual-connectivity LTE patches (see toolkit `INSTALL.md`).
 
 ### 2b. Add SNS3 satellite (REQUIRED)
 
-`ntn-cho` depends on `SatMobilityModel` for SGP4 orbit propagation:
+`ntn-cho` depends on the SNS3 `satellite` module's `SatSGP4MobilityModel`
+(SGP4 orbit propagation) and antenna-gain-pattern container:
 
 ```bash
 cd contrib/
@@ -45,6 +46,18 @@ cd ..
 ```
 
 > Size note: SNS3 + bundled TLE data is ~3.7 GB.
+
+### 2c. Add ns3-ai (OPTIONAL — only for the learning-based path)
+
+`NtnAiInterface` bridges to a Python agent via the `ns3-ai` module. The
+C++ CHO baselines (A3 / location / time / tte-aware) build and run
+**without** it; only add it if you want the AI interface:
+
+```bash
+cd contrib/
+git clone https://github.com/hust-diangroup/ns3-ai.git
+cd ..
+```
 
 ---
 
@@ -84,13 +97,17 @@ Modules to build: ... ntn-cho ...
 ### 5a. Single-pass realistic mobility demo (~10 s wall clock)
 
 ```bash
-./ns3 run "ntn-realistic-mobility-demo --simTime=600 --outputDir=/tmp/mob_demo"
+./ns3 run "ntn-realistic-mobility-demo --simTime=600 --dt=1 --outputDir=/tmp/mob_demo"
 ```
 
-This spawns 14 UEs across all 7 TR 38.811 §6.1.1.1 classes, advances them
-through 600 s of motion, and writes a per-step trajectory CSV.
+This advances UEs spanning the seven TR 38.811 §6.1.1.1 classes through
+600 s of motion and writes a per-step trajectory CSV
+(`/tmp/mob_demo/mobility_trace.csv`).
 
-### 5b. Full 66-satellite Walker-Star handover (~30 s wall clock)
+### 5b. Full Walker-constellation handover (~30 s wall clock)
+
+The constellation geometry (`--numPlanes`, `--satsPerPlane`) is built with
+the `satellite` module; defaults give a multi-plane LEO Walker layout.
 
 ```bash
 ./ns3 run "ntn-cho-full-constellation \
@@ -101,9 +118,12 @@ through 600 s of motion, and writes a per-step trajectory CSV.
   --outputDir=results/seed1/"
 ```
 
-CSV outputs land under `results/seed1/`:
-`ntn_handover_events.csv` · `tte_computations.csv` · `cho_state_log.csv` ·
-`satellite_tracks.csv` · `ntn_measurements.csv` · `kpi_summary.txt`.
+Outputs land under `results/seed1/`:
+`handover_events.csv` · `measurements.csv` · `tte_computations.csv` ·
+`satellite_tracks.csv` · `ue_tracks.csv` · `kpi_timeseries.csv` ·
+`kpi_summary.txt`, plus the GeoJSON layers `satellite_positions.geojson`,
+`ue_positions.geojson`, `beam_footprints.geojson`, and
+`handover_events.geojson`.
 
 ### 5c. Run the unit-test suite
 
@@ -115,15 +135,27 @@ Expected: **3 / 3 passing**.
 
 ---
 
-## 6. Reproduce the paper Monte-Carlo
+## 6. Reproduce the multi-seed comparison
 
-A 10-seed × 600-s campaign with all four algorithms is included:
+The aggregate KPIs reported in the manuscript come from sweeping the
+`ntn-cho-full-constellation` example over several seeds and the four
+algorithms. There is no bundled harness — drive it with a shell loop:
 
 ```bash
-cd papers/sim_runs/
-./run_mc_sweep.sh           # ~5 min total wall-clock on a modern CPU
-python3 build_figures.py    # generates the publication figures
+for algo in a3 location time tte-aware; do
+  for seed in $(seq 1 10); do
+    ./ns3 run "ntn-cho-full-constellation \
+      --algorithm=$algo --simTime=600 --numUes=30 \
+      --rngRun=$seed --outputDir=results/$algo/seed$seed/"
+  done
+done
+
+# Aggregate the per-run outputs into a comparison table + figures:
+python3 tools/analyze_results.py --datadir results/ --output results/figures/
 ```
+
+`tools/generate_cho_visualizations.py` turns the per-run CSV/GeoJSON into
+figures if you want them.
 
 ---
 
@@ -133,10 +165,10 @@ python3 build_figures.py    # generates the publication figures
 You forgot the SNS3 satellite module. ntn-cho will not register if
 `contrib/satellite/` is missing.
 
-**`MmWaveAmc not found`**
-You're missing the mmWave dependency. If you used the toolkit, this is
-already there. Otherwise: `cd contrib && git clone
-https://gitlab.com/cttc-lena/nr.git mmwave`.
+**`Ns3AiMsgInterface` / `ns3-ai` errors when building**
+Only the optional `NtnAiInterface` needs `ns3-ai` (step 2c). If you don't
+want the AI path, you can build the rest of the module without that
+module present.
 
 **Build cache filtering modules**
 If `ntn-cho` is silently excluded, run a clean configure:

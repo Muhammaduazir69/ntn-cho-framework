@@ -12,46 +12,119 @@ Overview
 --------
 
 The ``ntn-cho`` module provides a 3GPP Release-17 Conditional Handover
-(CHO) framework for Non-Terrestrial Networks (NTN) in ns-3.  The
-module integrates four CHO algorithms, an SGP4 orbit propagator, a
-Walker-Star constellation generator, and an mmWave+satellite channel
-adaptor built on top of the public ``mmwave`` contributed module.
+(CHO) framework for Non-Terrestrial Networks (NTN) in ns-3.  It adds an
+orbit-informed **Time-to-Exit (TTE)** trigger to the standard Rel-17
+CHO state machine and ships the classical A3 / location / time-based
+selectors as baselines for comparison.
+
+The module **consumes** the SGP4 orbit propagation and the Walker
+constellation geometry provided by the SNS3 ``satellite`` module
+(``SatSGP4MobilityModel`` + antenna-gain patterns); it does not
+re-implement orbit propagation or a constellation generator of its own.
 
 Model description
 -----------------
 
-The source code for the new module lives in
-``src/ntn-cho/model`` and ``src/ntn-cho/helper``.
+The source code lives in ``contrib/ntn-cho/model`` and
+``contrib/ntn-cho/helper``.
 
 Design
 ~~~~~~
 
 The module exposes the following public classes:
 
-* ``NtnTteEstimator`` — cached ``O(log n)`` estimator of the residual
-  beam-dwell time.
-* ``NtnCondHandoverAlgorithm`` — abstract CHO base class.  Concrete
-  subclasses: ``NtnTteCondHandoverAlgorithm``,
-  ``NtnA3CondHandoverAlgorithm``,
-  ``NtnTimeBasedCondHandoverAlgorithm``,
-  ``NtnLocationBasedCondHandoverAlgorithm``.
-* ``NtnSgp4Mobility`` — SGP4 orbit propagator following the public
-  Vallado reference implementation.
-* ``NtnConstellationHelper`` — Walker-Star ``(T,P,F)`` constellation
-  generator.
-* ``MmWaveSatChannel``, ``MmWaveSatPropagationLossModel``,
-  ``MmWaveSatSpectrumPropagationLossModel`` — mmWave + satellite
-  channel bridge.
+* ``NtnTteEstimator`` — Time-to-Exit estimator.  Propagates the
+  candidate satellite forward with a coarse step, then refines the
+  beam-exit instant with a **binary search**; the per-candidate result
+  is cached.
+* ``NtnChoAlgorithm`` — Rel-17 CHO state machine
+  (``IDLE → PREPARE → MONITOR → EXEC``).  The ``TriggerType`` enum
+  selects between ``TRIGGER_EVENT_A3``, ``TRIGGER_LOCATION_D1``
+  (condEventD1), ``TRIGGER_TIME_BASED``, the proposed
+  ``TRIGGER_TTE_AWARE``, and ``TRIGGER_THZ_BEAM_QUALITY``.
+* ``NtnOrbitPredictor`` — wraps the ``satellite`` module's
+  ``SatSGP4MobilityModel`` and antenna-gain-pattern container to
+  predict satellite sub-point, elevation, and beam coverage over time.
+* ``NtnMeasurementModel`` — per-UE RSRP / SINR / elevation / Doppler
+  generation that feeds the CHO triggers.
+* ``NtnAiInterface`` — optional ns3-ai bridge (observation / action
+  structs) for learning-based HO policies.  Requires the ``ns3-ai``
+  module.
+
+Helpers:
+
+* ``NtnChoHelper`` — wires the measurement model, TTE estimator, and
+  CHO algorithm onto a node container.
+* ``NtnRealisticMobilityHelper`` — per-class ground-UE motion for the
+  seven TR 38.811 §6.1.1.1 UE classes.
+* ``NtnRealisticTrafficHelper`` — per-class UDP traffic profiles.
 
 Scope and limitations
-~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~
 
-* The module targets LEO NTN scenarios; GEO/MEO are supported but not
-  yet validated.
-* The RRC connection procedure follows TS 38.331 Release 17
-  conditional handover.  Handling of multi-connectivity (split-CHO) is
-  not yet implemented.
-* The channel is frequency-flat over the assumed 400 MHz sub-band.
+* The module targets LEO NTN scenarios; GEO/MEO geometries are not
+  validated.
+* The CHO procedure follows TS 38.331 Release 17 conditional handover.
+  Multi-connectivity (split-CHO) is not implemented.
+* Orbit propagation and constellation geometry are delegated to the
+  ``satellite`` module; ``ntn-cho`` does not own that code.
+
+Attributes
+~~~~~~~~~~
+
+The registered, commonly-tuned attributes are:
+
+* ``NtnTteEstimator::PredictionStep`` — coarse forward step.
+* ``NtnTteEstimator::MaxPredictionWindow`` — forward search horizon.
+* ``NtnTteEstimator::BinarySearchTolerance`` — exit-time precision
+  (default 100 ms).
+* ``NtnTteEstimator::MaxBinarySearchIterations``.
+* ``NtnOrbitPredictor::MinGainThreshold`` — beam-edge gain threshold.
+* ``NtnChoAlgorithm::EnableMultiBandCho``,
+  ``ThzBeamTrackingThreshold``, ``ThzSnrThreshold``,
+  ``ThzBeamwidth`` — multi-band / THz-beam options.
+
+The remaining trigger parameters (D1 distance threshold, A3 offset and
+time-to-trigger, SINR quality threshold, minimum TTE) are set per run
+via the example command-line arguments
+(``--d1Threshold``, ``--qualityTh``, ``--tteMinimum``, …).
+
+Output
+~~~~~~
+
+``ntn-cho-full-constellation`` writes to ``--outputDir``:
+``handover_events.csv``, ``measurements.csv``, ``tte_computations.csv``,
+``satellite_tracks.csv``, ``ue_tracks.csv``, ``kpi_timeseries.csv``,
+the matching GeoJSON layers (``satellite_positions.geojson``,
+``ue_positions.geojson``, ``beam_footprints.geojson``,
+``handover_events.geojson``), and ``kpi_summary.txt``.
+
+Examples
+~~~~~~~~
+
+* ``ntn-cho-leo-basic.cc`` — minimal single-satellite CHO walkthrough.
+* ``ntn-cho-full-constellation.cc`` — multi-satellite Walker
+  constellation; selects the algorithm with
+  ``--algorithm=a3|location|time|tte-aware``.
+* ``ntn-realistic-mobility-demo.cc`` — seven-class UE mobility demo.
+
+Testing
+-------
+
+The ``ntn-cho`` unit-test suite (``test/ntn-cho-test-suite.cc``)
+contains three ``QUICK`` cases — ``NtnChoAlgorithmTestCase``,
+``NtnChoStateMachineTestCase``, and ``NtnMeasurementModelTestCase`` —
+which validate the algorithm and state-machine logic:
+
+.. sourcecode:: bash
+
+   ./test.py --suite=ntn-cho
+
+The aggregate KPIs reported in the associated manuscript (handover
+counts, ping-pong rate, success rate) are produced by sweeping
+``ntn-cho-full-constellation`` over multiple ``--rngRun`` seeds and the
+four ``--algorithm`` settings; they are **not** asserted by the unit
+suite.
 
 References
 ~~~~~~~~~~
@@ -59,58 +132,4 @@ References
 * 3GPP TS 38.331 v17, Radio Resource Control (RRC); Protocol
   specification.
 * 3GPP TR 38.821 v16, Solutions for NR to support NTN.
-* Vallado D. A., *Fundamentals of Astrodynamics and Applications*,
-  4th ed., Microcosm Press, 2013.
-
-Usage
------
-
-Helpers
-~~~~~~~
-
-``NtnConstellationHelper`` sets up the full Walker-Star constellation
-and attaches SGP4 mobility to every satellite node.  Helpers for
-channel, EPC, and mobility are also provided.
-
-Attributes
-~~~~~~~~~~
-
-The most commonly-tuned attributes are:
-
-* ``NtnTteCondHandoverAlgorithm::TteThresholdS`` — trigger threshold
-  on residual dwell time, seconds.
-* ``NtnTteCondHandoverAlgorithm::HysteresisDb`` — hysteresis margin on
-  the A3 offset, dB.
-* ``NtnConstellationHelper::TotalSats`` / ``Planes`` / ``Phasing``
-  / ``AltitudeKm`` — Walker-Star parameters.
-
-A full attribute table is given in Paper 2, Table V
-(``papers/paper2_taes_tte_cho/main.tex``).
-
-Output
-~~~~~~
-
-Each simulation writes six CSVs: ``handovers.csv``,
-``kpi_summary.csv``, ``tte_trace.csv``, ``beam_dwell.csv``,
-``track.csv``, ``sinr.csv``.
-
-Examples
-~~~~~~~~
-
-Representative examples are provided:
-
-* ``ntn-cho-scenario-a.cc`` — baseline single-cell handover.
-* ``ntn-cho-scenario-b-mc.cc`` — Monte-Carlo entry point.
-* ``ntn-cho-walker-star.cc`` — full Walker-Star constellation sweep.
-
-Validation
-----------
-
-The module ships a Monte-Carlo harness (5 seeds × 4 CHO algorithms)
-that reproduces the results reported in Paper 2 (IEEE TAES).  Run:
-
-.. sourcecode:: bash
-
-   cd papers/sim_runs
-   ./run_mc_sweep.sh
-   python3 build_figures.py
+* 3GPP TR 38.811 v15, Study on NR to support NTN.

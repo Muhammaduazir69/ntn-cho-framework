@@ -1,5 +1,0 @@
-Algorithm,Total HOs,Success (%),Failure (%),Ping-Pong (%),Avg ToS (s)
-Baseline A3,945,70.3,29.7,54.9,-
-Location-Only CHO,392,98.7,1.3,56.6,-
-Time-Based CHO,661,62.2,37.8,0.0,-
-TTE-Aware CHO (Proposed),245,88.2,11.8,0.0,-

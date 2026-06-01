@@ -9,3 +9,14 @@ package-lock.json
 .idea/
 *.swp
 .DS_Store
+
+# Generated simulation output — regenerate with the examples, do not commit.
+results/
+*.csv
+*.geojson
+# Generated figures/animations (regenerate with tools/generate_cho_visualizations.py).
+*.gif
+*.pdf
+# Keep the one architecture diagram and the App Store icon that the README uses.
+!docs/architecture.png
+!icon.png
