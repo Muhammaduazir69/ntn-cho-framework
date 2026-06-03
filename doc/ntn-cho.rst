@@ -17,10 +17,10 @@ orbit-informed **Time-to-Exit (TTE)** trigger to the standard Rel-17
 CHO state machine and ships the classical A3 / location / time-based
 selectors as baselines for comparison.
 
-The module **consumes** the SGP4 orbit propagation and the Walker
-constellation geometry provided by the SNS3 ``satellite`` module
-(``SatSGP4MobilityModel`` + antenna-gain patterns); it does not
-re-implement orbit propagation or a constellation generator of its own.
+Orbit propagation and the Walker constellation geometry are
+**consumed** from the SNS3 ``satellite`` module
+(``SatSGP4MobilityModel`` + antenna-gain patterns); ``ntn-cho`` does not
+implement orbit propagation or a constellation generator of its own.
 
 Model description
 -----------------
@@ -33,31 +33,25 @@ Design
 
 The module exposes the following public classes:
 
-* ``NtnTteEstimator`` — Time-to-Exit estimator.  Propagates the
-  candidate satellite forward with a coarse step, then refines the
-  beam-exit instant with a **binary search**; the per-candidate result
-  is cached.
 * ``NtnChoAlgorithm`` — Rel-17 CHO state machine
-  (``IDLE → PREPARE → MONITOR → EXEC``).  The ``TriggerType`` enum
-  selects between ``TRIGGER_EVENT_A3``, ``TRIGGER_LOCATION_D1``
-  (condEventD1), ``TRIGGER_TIME_BASED``, the proposed
-  ``TRIGGER_TTE_AWARE``, and ``TRIGGER_THZ_BEAM_QUALITY``.
+  (``CHO_IDLE → CHO_PREPARED → CHO_CONDITION_MONITORING →
+  CHO_EXECUTING → CHO_COMPLETED``) with selectable a3 / location / time
+  / tte-aware triggers.
+* ``NtnTteEstimator`` — Time-to-Exit estimator: forward propagation
+  plus a binary search for the beam-exit instant, cached per candidate.
 * ``NtnOrbitPredictor`` — wraps the ``satellite`` module's
-  ``SatSGP4MobilityModel`` and antenna-gain-pattern container to
-  predict satellite sub-point, elevation, and beam coverage over time.
-* ``NtnMeasurementModel`` — per-UE RSRP / SINR / elevation / Doppler
-  generation that feeds the CHO triggers.
-* ``NtnAiInterface`` — optional ns3-ai bridge (observation / action
-  structs) for learning-based HO policies.  Requires the ``ns3-ai``
-  module.
+  ``SatSGP4MobilityModel`` and antenna-gain-pattern container to predict
+  satellite/beam positions and the best beam per UE.
+* ``NtnMeasurementModel`` — RSRP / SINR / elevation / Doppler from
+  satellite beams using 3GPP TR 38.811 NTN channel scenarios.
+* ``NtnAiInterface`` — optional ns3-ai bridge (observation / action) for
+  learning-based HO policies; requires the ``ns3-ai`` module.
 
 Helpers:
 
-* ``NtnChoHelper`` — wires the measurement model, TTE estimator, and
-  CHO algorithm onto a node container.
-* ``NtnRealisticMobilityHelper`` — per-class ground-UE motion for the
-  seven TR 38.811 §6.1.1.1 UE classes.
-* ``NtnRealisticTrafficHelper`` — per-class UDP traffic profiles.
+* ``NtnChoHelper`` — wires up a CHO scenario and reports KPIs.
+* ``NtnRealisticMobilityHelper`` (+ ``NtnMobilityScenarios``) — per-class
+  ground-UE motion for the seven TR 38.811 §6.1.1.1 UE classes.
 
 Scope and limitations
 ~~~~~~~~~~~~~~~~~~~~~~~
@@ -74,20 +68,15 @@ Attributes
 
 The registered, commonly-tuned attributes are:
 
-* ``NtnTteEstimator::PredictionStep`` — coarse forward step.
-* ``NtnTteEstimator::MaxPredictionWindow`` — forward search horizon.
-* ``NtnTteEstimator::BinarySearchTolerance`` — exit-time precision
-  (default 100 ms).
-* ``NtnTteEstimator::MaxBinarySearchIterations``.
+* ``NtnTteEstimator::PredictionStep`` / ``MaxPredictionWindow`` /
+  ``BinarySearchTolerance`` / ``MaxBinarySearchIterations``.
 * ``NtnOrbitPredictor::MinGainThreshold`` — beam-edge gain threshold.
-* ``NtnChoAlgorithm::EnableMultiBandCho``,
-  ``ThzBeamTrackingThreshold``, ``ThzSnrThreshold``,
-  ``ThzBeamwidth`` — multi-band / THz-beam options.
+* ``NtnChoAlgorithm::EnableMultiBandCho`` /
+  ``ThzBeamTrackingThreshold`` / ``ThzSnrThreshold`` / ``ThzBeamwidth``.
 
-The remaining trigger parameters (D1 distance threshold, A3 offset and
-time-to-trigger, SINR quality threshold, minimum TTE) are set per run
-via the example command-line arguments
-(``--d1Threshold``, ``--qualityTh``, ``--tteMinimum``, …).
+The remaining trigger parameters (D1 distance, SINR quality threshold,
+minimum TTE, A3 offset / time-to-trigger) are set per run via the
+example command-line arguments.
 
 Output
 ~~~~~~
@@ -95,36 +84,29 @@ Output
 ``ntn-cho-full-constellation`` writes to ``--outputDir``:
 ``handover_events.csv``, ``measurements.csv``, ``tte_computations.csv``,
 ``satellite_tracks.csv``, ``ue_tracks.csv``, ``kpi_timeseries.csv``,
-the matching GeoJSON layers (``satellite_positions.geojson``,
-``ue_positions.geojson``, ``beam_footprints.geojson``,
-``handover_events.geojson``), and ``kpi_summary.txt``.
+the matching GeoJSON layers, and ``kpi_summary.txt``.
 
 Examples
 ~~~~~~~~
 
-* ``ntn-cho-leo-basic.cc`` — minimal single-satellite CHO walkthrough.
+* ``ntn-cho-leo-basic.cc`` — event-driven smoke test with real UDP
+  traffic.
 * ``ntn-cho-full-constellation.cc`` — multi-satellite Walker
-  constellation; selects the algorithm with
-  ``--algorithm=a3|location|time|tte-aware``.
+  constellation; ``--algorithm=a3|location|time|tte-aware``.
+* ``ntn-cho-handover-traffic.cc`` — a UDP flow that follows the UE
+  across a satellite handover (PointToPoint links + FlowMonitor).
 * ``ntn-realistic-mobility-demo.cc`` — seven-class UE mobility demo.
 
 Testing
 -------
 
 The ``ntn-cho`` unit-test suite (``test/ntn-cho-test-suite.cc``)
-contains three ``QUICK`` cases — ``NtnChoAlgorithmTestCase``,
-``NtnChoStateMachineTestCase``, and ``NtnMeasurementModelTestCase`` —
-which validate the algorithm and state-machine logic:
+validates the CHO algorithm, the CHO state machine, and the NTN
+measurement model:
 
 .. sourcecode:: bash
 
    ./test.py --suite=ntn-cho
-
-The aggregate KPIs reported in the associated manuscript (handover
-counts, ping-pong rate, success rate) are produced by sweeping
-``ntn-cho-full-constellation`` over multiple ``--rngRun`` seeds and the
-four ``--algorithm`` settings; they are **not** asserted by the unit
-suite.
 
 References
 ~~~~~~~~~~

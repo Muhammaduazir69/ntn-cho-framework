@@ -1,3 +1,7 @@
+# Standalone (App Store) build: NtnRealisticTrafficHelper is vendored into
+# libntn-cho, so the leo-basic / full-constellation examples link ${libntn-cho}
+# directly — no external ntn-traffic module is required.
+
 build_lib_example(
   NAME ntn-cho-leo-basic
   SOURCE_FILES ntn-cho-leo-basic.cc
@@ -30,4 +34,19 @@ build_lib_example(
   LIBRARIES_TO_LINK
     ${libntn-cho}
     ${libcore}
+)
+
+# Real UDP traffic handed over between two LEO sats by the TTE-aware CHO.
+build_lib_example(
+  NAME ntn-cho-handover-traffic
+  SOURCE_FILES ntn-cho-handover-traffic.cc
+  LIBRARIES_TO_LINK
+    ${libntn-cho}
+    ${libcore}
+    ${libnetwork}
+    ${libmobility}
+    ${libpoint-to-point}
+    ${libinternet}
+    ${libapplications}
+    ${libflow-monitor}
 )
