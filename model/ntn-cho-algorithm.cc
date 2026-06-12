@@ -177,10 +177,302 @@ NtnChoAlgorithm::UpdateMeasurement(uint16_t cellId, double sinr_dB, double gain_
     auto it = m_candidates.find(cellId);
     if (it != m_candidates.end())
     {
-        it->second.sinr_dB = sinr_dB;
-        it->second.gain_dB = gain_dB;
-        it->second.lastUpdate = Simulator::Now();
+        CandidateInfo& cand = it->second;
+        cand.sinr_dB = sinr_dB;
+        cand.gain_dB = gain_dB;
+        cand.lastUpdate = Simulator::Now();
+
+        // ---- Rel-19 LTM: L1 moving-average filter over the last K reports ----
+        const uint8_t k = std::max<uint8_t>(1, m_config.ltmL1FilterK);
+        if (cand.l1Filtered_dB <= -99.0)
+        {
+            cand.l1Filtered_dB = sinr_dB; // first report seeds the filter
+        }
+        else
+        {
+            const double alpha = 1.0 / static_cast<double>(k);
+            cand.l1Filtered_dB = (1.0 - alpha) * cand.l1Filtered_dB + alpha * sinr_dB;
+        }
+
+        // ---- PCHO: bounded SINR history for the trajectory forecast ----
+        cand.sinrHistory.emplace_back(Simulator::Now().GetSeconds(), sinr_dB);
+        if (cand.sinrHistory.size() > 32)
+        {
+            cand.sinrHistory.erase(cand.sinrHistory.begin());
+        }
     }
+    if (cellId == m_servingCellId)
+    {
+        UpdateServingMeasurement(sinr_dB);
+    }
+}
+
+void
+NtnChoAlgorithm::UpdateServingMeasurement(double sinr_dB)
+{
+    m_servingSinr_dB = sinr_dB;
+    m_servingSinrHistory.emplace_back(Simulator::Now().GetSeconds(), sinr_dB);
+    if (m_servingSinrHistory.size() > 32)
+    {
+        m_servingSinrHistory.erase(m_servingSinrHistory.begin());
+    }
+}
+
+void
+NtnChoAlgorithm::SetServingCell(uint16_t cellId)
+{
+    m_servingCellId = cellId;
+}
+
+void
+NtnChoAlgorithm::UpdateCandidateSlantRange(uint16_t cellId, double slantRangeM)
+{
+    auto it = m_candidates.find(cellId);
+    if (it != m_candidates.end())
+    {
+        it->second.slantRangeM = slantRangeM;
+    }
+}
+
+NtnChoAlgorithm::MechanismStats
+NtnChoAlgorithm::GetMechanismStats() const
+{
+    return m_mechStats;
+}
+
+double
+NtnChoAlgorithm::ForecastSinr(const std::vector<std::pair<double, double>>& history,
+                              double horizonS) const
+{
+    // Least-squares linear trend over the history window — the documented
+    // stand-in for the PCHO GRU trajectory predictor (Yang et al.). With a
+    // LEO pass the SINR trend over a few seconds is locally linear, so the
+    // trend forecast captures the approach/recede dynamics the GRU learns.
+    const size_t n = history.size();
+    if (n < 2)
+    {
+        return n == 1 ? history.back().second : -100.0;
+    }
+    double sumT = 0, sumS = 0, sumTT = 0, sumTS = 0;
+    for (const auto& [t, s] : history)
+    {
+        sumT += t;
+        sumS += s;
+        sumTT += t * t;
+        sumTS += t * s;
+    }
+    const double denom = n * sumTT - sumT * sumT;
+    if (std::abs(denom) < 1e-9)
+    {
+        return history.back().second;
+    }
+    const double slope = (n * sumTS - sumT * sumS) / denom;
+    const double intercept = (sumS - slope * sumT) / n;
+    const double tF = Simulator::Now().GetSeconds() + horizonS;
+    return intercept + slope * tF;
+}
+
+double
+NtnChoAlgorithm::ElevationFromSlantDeg(double slantRangeM) const
+{
+    if (slantRangeM <= 0.0)
+    {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    // Spherical-Earth relation for a circular shell at the configured
+    // altitude: sin(elev) = ((R+h)^2 - R^2 - d^2) / (2 R d).
+    constexpr double kRe = 6371e3;
+    const double rs = kRe + m_config.orbitAltitudeKm * 1e3;
+    const double d = slantRangeM;
+    const double s = (rs * rs - kRe * kRe - d * d) / (2.0 * kRe * d);
+    if (s < -1.0 || s > 1.0)
+    {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    return std::asin(s) * 180.0 / M_PI;
+}
+
+void
+NtnChoAlgorithm::EvaluateStandardNtnTrigger(CandidateInfo& cand)
+{
+    cand.admitted = false;
+    cand.tte = Seconds(0);
+    if (cand.sinr_dB < m_config.qualityThreshold_dB)
+    {
+        // The quality precondition IS the A4 entering condition (Thresh =
+        // qualityThreshold_dB); leaving it resets the A4 time-to-trigger.
+        cand.a4MetSince = Seconds(-1.0);
+        return; // every class keeps the radio-quality precondition
+    }
+    if (cand.a4MetSince < Seconds(0))
+    {
+        cand.a4MetSince = Simulator::Now();
+    }
+    if (m_config.combineWithA4 &&
+        Simulator::Now() - cand.a4MetSince < m_config.a3TimeToTrigger)
+    {
+        // Rel-17 combination semantics: the A4 leg must hold for the TTT
+        // before a T1/D1/D2 CondEvent may admit the candidate.
+        return;
+    }
+    constexpr double kC = 299792458.0;
+
+    switch (m_config.triggerType)
+    {
+    case TRIGGER_TIME_T1: {
+        // CondEventT1: the ephemeris-scheduled window opens when the SERVING
+        // cell's remaining time-of-service drops inside t1WindowDuration.
+        if (!m_tteEstimator)
+        {
+            return;
+        }
+        auto servingIt = m_candidates.find(m_servingCellId);
+        if (servingIt == m_candidates.end())
+        {
+            return;
+        }
+        const auto servingTte = m_tteEstimator->ComputeTte(m_uePosition,
+                                                           m_ueVelocity,
+                                                           servingIt->second.satId,
+                                                           servingIt->second.beamId,
+                                                           m_config.gainThreshold_dB);
+        cand.admitted = (servingTte.tte > Seconds(0) &&
+                         servingTte.tte <= m_config.t1WindowDuration);
+        break;
+    }
+    case TRIGGER_ELEVATION: {
+        auto servingIt = m_candidates.find(m_servingCellId);
+        if (servingIt == m_candidates.end())
+        {
+            return;
+        }
+        const double servingElev = ElevationFromSlantDeg(servingIt->second.slantRangeM);
+        const double candElev = ElevationFromSlantDeg(cand.slantRangeM);
+        cand.admitted = (!std::isnan(servingElev) && !std::isnan(candElev) &&
+                         servingElev < m_config.elevationMinDeg &&
+                         candElev >= m_config.elevationMinDeg + m_config.elevationHystDeg);
+        break;
+    }
+    case TRIGGER_TIMING_ADVANCE: {
+        auto servingIt = m_candidates.find(m_servingCellId);
+        if (servingIt == m_candidates.end() || cand.slantRangeM <= 0.0 ||
+            servingIt->second.slantRangeM <= 0.0)
+        {
+            return;
+        }
+        const Time taServing = Seconds(2.0 * servingIt->second.slantRangeM / kC);
+        const Time taCand = Seconds(2.0 * cand.slantRangeM / kC);
+        cand.admitted = (taServing > m_config.taServingMax) ||
+                        (taServing - taCand >= m_config.taAdvantage);
+        break;
+    }
+    case TRIGGER_DISTANCE_D2: {
+        // Rel-18 CondEventD2 (TS 38.331 §5.5.4.15a): both reference
+        // locations MOVE with the satellites (live ephemeris beam centers).
+        // Entering condition: Ml1 - Hys > Thresh1 AND Ml2 + Hys < Thresh2.
+        auto servingIt = m_candidates.find(m_servingCellId);
+        if (servingIt == m_candidates.end())
+        {
+            return;
+        }
+        const double dServing = DistanceToMovingReference(servingIt->second);
+        const double dCand = DistanceToMovingReference(cand);
+        if (dServing < 0.0 || dCand < 0.0)
+        {
+            return; // no ephemeris for one of the moving references
+        }
+        const double hys = m_config.d2HysteresisLocation_m;
+        cand.admitted = (dServing - hys > m_config.d2Thresh1_m) &&
+                        (dCand + hys < m_config.d2Thresh2_m);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+void
+NtnChoAlgorithm::EvaluateLtmConditional(CandidateInfo& cand)
+{
+    // Rel-19 conditional LTM: the L1-filtered candidate measurement must
+    // exceed the serving L1 quality + hysteresis for N consecutive reports
+    // (LTM speed), AND the candidate must pass the ephemeris TTE stability
+    // filter (CHO reliability) when an estimator is wired.
+    const bool above = cand.l1Filtered_dB >= m_servingSinr_dB + m_config.ltmHysteresis_dB;
+    cand.l1AboveCount = above ? std::min<uint8_t>(cand.l1AboveCount + 1, 250) : 0;
+
+    bool tteOk = true;
+    if (m_tteEstimator)
+    {
+        auto tteResult = m_tteEstimator->ComputeTte(m_uePosition,
+                                                    m_ueVelocity,
+                                                    cand.satId,
+                                                    cand.beamId,
+                                                    m_config.gainThreshold_dB);
+        cand.tte = tteResult.tte;
+        // Apply the CHO-reliability TTE filter only when the estimator could
+        // actually produce an estimate (ephemeris registered for this satId);
+        // a zero TTE means "unknown", which must not veto the L1 trigger.
+        tteOk = (cand.tte == Seconds(0)) || (cand.tte >= m_config.tteMinimum);
+    }
+    cand.admitted = (cand.l1AboveCount >= m_config.ltmConsecutiveReports) && tteOk &&
+                    (cand.sinr_dB >= m_config.qualityThreshold_dB);
+}
+
+void
+NtnChoAlgorithm::EvaluateTrajectoryPredictive(CandidateInfo& cand)
+{
+    // PCHO: forecast both trajectories at +horizon; admit a candidate when
+    // the serving cell is PREDICTED to fall below quality within the horizon
+    // while the candidate is predicted to stay above it, and the candidate's
+    // predicted time-of-stay (capped by the ephemeris TTE) clears the floor.
+    const double h = m_config.predictionHorizon.GetSeconds();
+    if (cand.sinrHistory.size() < m_config.predictionMinSamples ||
+        m_servingSinrHistory.size() < m_config.predictionMinSamples)
+    {
+        cand.admitted = false;
+        return;
+    }
+    const double servingPredicted = ForecastSinr(m_servingSinrHistory, h);
+    cand.predictedSinr_dB = ForecastSinr(cand.sinrHistory, h);
+
+    // Predicted time-of-stay: time until the candidate's forecast trend
+    // crosses the quality threshold (clamped to [0, 10*h]), fused with the
+    // ephemeris TTE when available.
+    double tosS = 10.0 * h;
+    const double now = Simulator::Now().GetSeconds();
+    const double slope = (cand.predictedSinr_dB - cand.sinr_dB) / std::max(1e-3, h);
+    if (slope < -1e-6)
+    {
+        tosS = std::max(0.0, (cand.sinr_dB - m_config.qualityThreshold_dB) / -slope);
+    }
+    if (m_tteEstimator)
+    {
+        auto tteResult = m_tteEstimator->ComputeTte(m_uePosition,
+                                                    m_ueVelocity,
+                                                    cand.satId,
+                                                    cand.beamId,
+                                                    m_config.gainThreshold_dB);
+        cand.tte = tteResult.tte;
+        if (cand.tte > Seconds(0)) // zero = no ephemeris registered (unknown)
+        {
+            tosS = std::min(tosS, cand.tte.GetSeconds());
+        }
+    }
+    cand.predictedTos = Seconds(tosS);
+    (void)now;
+
+    // PCHO fires proactively on EITHER predicted condition (Yang et al.):
+    //  (a) predicted serving outage within the horizon, or
+    //  (b) predicted best-server change — the candidate trajectory is forecast
+    //      to exceed the serving trajectory by the hysteresis margin.
+    const bool servingWillDegrade = servingPredicted < m_config.qualityThreshold_dB;
+    const bool bestServerChange =
+        cand.predictedSinr_dB >= servingPredicted + m_config.pchoHysteresis_dB;
+    const bool candidateWillHold = cand.predictedSinr_dB >= m_config.qualityThreshold_dB;
+    cand.admitted = (servingWillDegrade || bestServerChange) && candidateWillHold &&
+                    (cand.predictedTos >= m_config.minPredictedTos) &&
+                    (cand.sinr_dB >= m_config.qualityThreshold_dB);
 }
 
 void
@@ -230,6 +522,49 @@ NtnChoAlgorithm::EvaluateConditions()
 
     for (auto& [cellId, cand] : m_candidates)
     {
+        // The serving cell is tracked for hysteresis/outage prediction but is
+        // never admitted as its own handover target.
+        if (cellId == m_servingCellId)
+        {
+            cand.admitted = false;
+            continue;
+        }
+
+        // ---- Novel 6G triggers: measurement-driven, not D1-gated ----
+        if (m_config.triggerType == TRIGGER_LTM_CONDITIONAL)
+        {
+            EvaluateLtmConditional(cand);
+            m_candidateEvalTrace(cellId, cand.sinr_dB, cand.tte, cand.admitted);
+            if (cand.admitted && !m_admitCallback.IsNull())
+            {
+                m_admitCallback(cellId, cand.sinr_dB, cand.tte);
+            }
+            continue;
+        }
+        if (m_config.triggerType == TRIGGER_TRAJECTORY_PREDICTIVE)
+        {
+            EvaluateTrajectoryPredictive(cand);
+            m_candidateEvalTrace(cellId, cand.sinr_dB, cand.tte, cand.admitted);
+            if (cand.admitted && !m_admitCallback.IsNull())
+            {
+                m_admitCallback(cellId, cand.sinr_dB, cand.tte);
+            }
+            continue;
+        }
+        if (m_config.triggerType == TRIGGER_TIME_T1 ||
+            m_config.triggerType == TRIGGER_ELEVATION ||
+            m_config.triggerType == TRIGGER_TIMING_ADVANCE ||
+            m_config.triggerType == TRIGGER_DISTANCE_D2)
+        {
+            EvaluateStandardNtnTrigger(cand);
+            m_candidateEvalTrace(cellId, cand.sinr_dB, cand.tte, cand.admitted);
+            if (cand.admitted && !m_admitCallback.IsNull())
+            {
+                m_admitCallback(cellId, cand.sinr_dB, cand.tte);
+            }
+            continue;
+        }
+
         // Step 1: Check D1 condition
         bool d1Now = CheckD1Condition(cand);
 
@@ -320,6 +655,57 @@ NtnChoAlgorithm::SelectBestCandidate() const
     // 3. Select: candidate with maximum TTE
     // 4. Tie-break: if multiple within epsilon, pick highest SINR
     // ================================================================
+
+    // ---- Novel 6G triggers have their own selection rules ----
+    if (m_config.triggerType == TRIGGER_LTM_CONDITIONAL)
+    {
+        // LTM: fastest-quality cell — max L1-filtered SINR among admitted.
+        const CandidateInfo* bestLtm = nullptr;
+        for (const auto& [cellId, info] : m_candidates)
+        {
+            if (info.admitted && (!bestLtm || info.l1Filtered_dB > bestLtm->l1Filtered_dB))
+            {
+                bestLtm = &info;
+            }
+        }
+        return bestLtm ? bestLtm->cellId : INVALID_CELL_ID;
+    }
+    if (m_config.triggerType == TRIGGER_TRAJECTORY_PREDICTIVE)
+    {
+        // PCHO: max predicted time-of-stay; tie-break on predicted SINR.
+        const CandidateInfo* bestP = nullptr;
+        for (const auto& [cellId, info] : m_candidates)
+        {
+            if (!info.admitted)
+            {
+                continue;
+            }
+            if (!bestP || info.predictedTos > bestP->predictedTos ||
+                (info.predictedTos == bestP->predictedTos &&
+                 info.predictedSinr_dB > bestP->predictedSinr_dB))
+            {
+                bestP = &info;
+            }
+        }
+        return bestP ? bestP->cellId : INVALID_CELL_ID;
+    }
+
+    if (m_config.triggerType == TRIGGER_TIME_T1 ||
+        m_config.triggerType == TRIGGER_ELEVATION ||
+        m_config.triggerType == TRIGGER_TIMING_ADVANCE)
+    {
+        // The admit set already encodes the standardized condition; take the
+        // strongest measured candidate.
+        const CandidateInfo* bestStd = nullptr;
+        for (const auto& [cellId, info] : m_candidates)
+        {
+            if (info.admitted && (!bestStd || info.sinr_dB > bestStd->sinr_dB))
+            {
+                bestStd = &info;
+            }
+        }
+        return bestStd ? bestStd->cellId : INVALID_CELL_ID;
+    }
 
     std::vector<const CandidateInfo*> admissible;
 
@@ -432,6 +818,53 @@ NtnChoAlgorithm::ExecuteHandover(uint16_t targetCellId)
                        tos < Seconds(5.0)); // 5s ping-pong threshold
 
     TransitionState(CHO_EXECUTING);
+
+    // ---- Novel 6G execution accounting (LTM fast switch + RACH-less) ----
+    // Base execution latency: Rel-19 LTM = MAC-CE cell switch (tens of ms);
+    // classic CHO = RRC reconfiguration execution.
+    const bool isLtm = (m_config.triggerType == TRIGGER_LTM_CONDITIONAL);
+    double interruptionMs = (isLtm ? m_config.ltmSwitchDelay : m_config.choExecutionDelay)
+                                .GetMilliSeconds();
+    // RACH-less (RCHO): with UE GNSS + satellite ephemeris (SIB19) the target
+    // TA is pre-compensated (TS 38.821 §6.3.3), so the RACH is skipped;
+    // otherwise the NTN RACH (incl. slant RTT) is paid.
+    auto targetIt = m_candidates.find(targetCellId);
+    const bool haveSlant = (targetIt != m_candidates.end() && targetIt->second.slantRangeM > 0.0);
+    if (m_config.rachLess && haveSlant)
+    {
+        m_mechStats.lastPreCompTaUs =
+            2.0 * targetIt->second.slantRangeM / 299792458.0 * 1e6; // round-trip TA
+        ++m_mechStats.rachLessExecutions;
+    }
+    else
+    {
+        // Slant-dependent RACH cost: the 4-step RACH pays at least one slant
+        // round-trip plus processing; the constant rachDuration misprices it
+        // across a LEO pass (slant RTT varies by several ms). Fall back to
+        // the constant only when the target's slant range is unknown.
+        if (haveSlant)
+        {
+            const double rachMs =
+                2.0 * targetIt->second.slantRangeM / 299792458.0 * 1e3 +
+                m_config.rachProcessingDelay.GetMilliSeconds();
+            interruptionMs += rachMs;
+        }
+        else
+        {
+            interruptionMs += m_config.rachDuration.GetMilliSeconds();
+        }
+        ++m_mechStats.rachExecutions;
+    }
+    if (isLtm)
+    {
+        ++m_mechStats.ltmSwitches;
+    }
+    if (m_config.triggerType == TRIGGER_TRAJECTORY_PREDICTIVE)
+    {
+        ++m_mechStats.pchoTriggers;
+    }
+    m_mechStats.lastInterruptionMs = interruptionMs;
+    m_mechStats.totalInterruptionMs += interruptionMs;
 
     // Fire execution trace
     m_handoverExecutedTrace(sourceCell, targetCellId, tos);
@@ -546,6 +979,22 @@ NtnChoAlgorithm::CheckD1Condition(const CandidateInfo& cand) const
     double dist = std::sqrt(dx * dx + dy * dy + dz * dz);
 
     return (dist <= m_config.d1Threshold_m);
+}
+
+double
+NtnChoAlgorithm::DistanceToMovingReference(const CandidateInfo& cand) const
+{
+    if (!m_orbitPredictor)
+    {
+        return -1.0;
+    }
+    auto snap = m_orbitPredictor->GetBeamSnapshot(cand.satId, cand.beamId, m_uePosition);
+    const Vector ueCart = m_uePosition.ToVector();
+    const Vector refCart = snap.beamCenter.ToVector();
+    const double dx = ueCart.x - refCart.x;
+    const double dy = ueCart.y - refCart.y;
+    const double dz = ueCart.z - refCart.z;
+    return std::sqrt(dx * dx + dy * dy + dz * dz);
 }
 
 void

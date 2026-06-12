@@ -1,18 +1,17 @@
-# Standalone (App Store) build: NtnRealisticTrafficHelper is vendored into
-# libntn-cho, so the leo-basic / full-constellation examples link ${libntn-cho}
-# directly — no external ntn-traffic module is required.
-
 build_lib_example(
   NAME ntn-cho-leo-basic
   SOURCE_FILES ntn-cho-leo-basic.cc
   LIBRARIES_TO_LINK
     ${libntn-cho}
+    ${libntn-traffic}
+    ${libntn-constellation}
     ${libcore}
     ${libnetwork}
     ${libmobility}
     ${libinternet}
     ${libapplications}
-    ${libpoint-to-point}
+    ${libmmwave}
+    ${liblte}
 )
 
 build_lib_example(
@@ -20,12 +19,15 @@ build_lib_example(
   SOURCE_FILES ntn-cho-full-constellation.cc
   LIBRARIES_TO_LINK
     ${libntn-cho}
+    ${libntn-traffic}
+    ${libntn-constellation}
     ${libcore}
     ${libnetwork}
     ${libmobility}
     ${libinternet}
     ${libapplications}
-    ${libpoint-to-point}
+    ${libmmwave}
+    ${liblte}
 )
 
 build_lib_example(
@@ -36,17 +38,37 @@ build_lib_example(
     ${libcore}
 )
 
-# Real UDP traffic handed over between two LEO sats by the TTE-aware CHO.
+# Real UDP traffic to a ground UE on a real mmwave NR cell, handed over by the
+# TTE-aware CHO on MEASURED serving SINR.
 build_lib_example(
   NAME ntn-cho-handover-traffic
   SOURCE_FILES ntn-cho-handover-traffic.cc
   LIBRARIES_TO_LINK
     ${libntn-cho}
+    ${libntn-traffic}
+    ${libntn-constellation}
     ${libcore}
     ${libnetwork}
     ${libmobility}
-    ${libpoint-to-point}
     ${libinternet}
     ${libapplications}
-    ${libflow-monitor}
+    ${libmmwave}
+    ${liblte}
+)
+
+# Real-stack flagship: TTE-aware CHO decides on MEASURED mmwave SINR.
+build_lib_example(
+  NAME ntn-cho-real-stack
+  SOURCE_FILES ntn-cho-real-stack.cc
+  LIBRARIES_TO_LINK
+    ${libntn-cho}
+    ${libntn-traffic}
+    ${libntn-constellation}
+    ${libcore}
+    ${libnetwork}
+    ${libmobility}
+    ${libinternet}
+    ${libapplications}
+    ${libmmwave}
+    ${liblte}
 )

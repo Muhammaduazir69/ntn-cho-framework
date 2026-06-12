@@ -1,21 +1,36 @@
+/* -*- Mode:C++; c-file-style:"gnu"; indent-tabs-mode:nil; -*- */
 /*
+ * Copyright (c) 2026  Muhammad Uzair
  * SPDX-License-Identifier: GPL-2.0-only
- * Copyright (c) 2026 Muhammad Uzair (ns3-ntn-toolkit)
  *
- * ntn-cho-handover-traffic — REAL UDP downlink traffic to TR 38.811 UEs served
- * by a real mmwave NR NTN cell (NtnRealStackHelper: SpectrumPhy + MAC + HARQ +
- * RLC/PDCP + RRC + EPC), with the NtnChoAlgorithm deciding the handover on the
- * MEASURED serving SINR while the constellation flies REAL SGP4 Walker orbits:
- * the serving satellite passes zenith and recedes, the in-plane neighbour
- * approaches, and the handover falls out of the genuine orbital crossover.
- * UEs move under 3GPP TR 38.811 §6.1.1.1 class mobility (real MobilityModel).
+ * ntn-cho-real-stack — real-stack flagship for ntn-cho, on the REAL NTN
+ * mobility architecture:
  *
- * Mechanism selectable: --trigger=tte-aware|ltm|pcho, --rachLess=1 (RCHO).
- * The data-continuity result is the measured serving-cell goodput across the
- * handover, reported in the summary.
+ *   - Satellites: SGP4-propagated Walker-Delta orbits (ntn-constellation
+ *     Sgp4MobilityModel). The serving satellite starts at zenith over the UE
+ *     field and recedes; the in-plane neighbour genuinely approaches. The
+ *     handover emerges from REAL orbital dynamics — no teleports.
+ *   - UEs: 3GPP TR 38.811 §6.1.1.1 class mobility (NtnTr38811MobilityModel,
+ *     ECEF) — pedestrians/vehicles/IoT moving under the pass.
+ *   - Radio: real mmwave NR NTN cell (NtnRealStackHelper: SpectrumPhy + MAC +
+ *     HARQ + RLC/PDCP + RRC + EPC); serving SINR/TBLER MEASURED off the PHY.
  *
- * Quick test:  --simSeconds=60 --numUes=2 --trigger=tte-aware
+ * Novel 6G handover mechanisms (selectable, implemented in NtnChoAlgorithm):
+ *   --trigger=tte-aware  TTE-aware CHO (the toolkit's Rel-17 baseline novelty)
+ *   --trigger=ltm        Rel-19 conditional LTM: L1-filtered measurements +
+ *                        CHO reliability; MAC-CE fast switch (~25 ms)
+ *   --trigger=pcho       trajectory-prediction CHO: forecast serving outage +
+ *                        max predicted time-of-stay candidate
+ *   --rachLess           RCHO: ephemeris/GNSS TA pre-compensation skips RACH
+ *
+ * Candidate link prediction is ephemeris-based (3GPP NTN CHO design): the
+ * candidate SINR is the MEASURED serving SINR corrected by the real Friis
+ * range ratio 20*log10(servSlant/candSlant) from the live SGP4 slant ranges.
+ *
+ * Usage:
+ *   ./ns3 run "ntn-cho-real-stack --duration=60 --trigger=pcho --rachLess=1"
  */
+
 #include "ns3/core-module.h"
 #include "ns3/mmwave-enb-net-device.h"
 #include "ns3/mobility-module.h"
@@ -30,13 +45,15 @@
 
 #include <cmath>
 #include <cstdio>
+#include <iostream>
+#include <vector>
 
 using namespace ns3;
 using ns3::ntncon::Sgp4MobilityModel;
 using ns3::ntncon::WalkerConfig;
 using ns3::ntncon::WalkerConstellation;
 
-NS_LOG_COMPONENT_DEFINE("NtnChoHandoverTraffic");
+NS_LOG_COMPONENT_DEFINE("NtnChoRealStack");
 
 namespace
 {
@@ -51,7 +68,6 @@ uint16_t g_serving = 0;
 uint32_t g_handovers = 0;
 uint32_t g_evals = 0;
 double g_simTime = 60.0;
-double g_sinrAtHo = 0.0;
 
 void
 ChoTick()
@@ -61,51 +77,53 @@ ChoTick()
         return;
     }
     ++g_evals;
-    const Vector u = g_ueMob->GetPosition();
-    const Vector sPos = g_servMob->GetPosition();
-    const Vector cPos = g_candMob->GetPosition();
+    const Vector u = g_ueMob->GetPosition();        // TR 38.811 UE, ECEF
+    const Vector sPos = g_servMob->GetPosition();   // SGP4 serving sat, ECEF
+    const Vector cPos = g_candMob->GetPosition();   // SGP4 candidate sat, ECEF
     const double servElev = ntngeo::ElevationDeg(u, sPos);
     const double candElev = ntngeo::ElevationDeg(u, cPos);
     const double servSlant = ntngeo::SlantRangeM(u, sPos);
     const double candSlant = ntngeo::SlantRangeM(u, cPos);
 
+    // Serving SINR is MEASURED from the real mmwave PHY (UE 0).
     const double servSinr = g_rs->GetUeRecentSinrDb(0);
     if (std::isnan(servSinr))
     {
         Simulator::Schedule(Seconds(1.0), &ChoTick);
         return;
     }
-    // Ephemeris-predicted candidate SINR: measured baseline + real Friis ratio.
+    // Candidate SINR: ephemeris-predicted from the REAL slant-range ratio
+    // (Friis correction off the measured serving baseline — 3GPP NTN CHO).
     const double candSinr = servSinr + 20.0 * std::log10(servSlant / std::max(1.0, candSlant));
     const double servGain = std::max(-20.0, (servElev - 45.0) / 5.0);
     const double candGain = std::max(-20.0, (candElev - 45.0) / 5.0);
 
     g_cho->UpdateMeasurement(g_servingCellId, servSinr, servGain);
     g_cho->UpdateMeasurement(g_candCellId, candSinr, candGain);
+    // Live ephemeris slant ranges -> RACH-less TA pre-compensation (RCHO).
     g_cho->UpdateCandidateSlantRange(g_servingCellId, servSlant);
     g_cho->UpdateCandidateSlantRange(g_candCellId, candSlant);
     g_cho->EvaluateConditions();
 
     uint16_t chosen = g_cho->SelectBestCandidate();
-    if (chosen == 0)
-    {
-        // TTE-aware fallback before the estimator admits: better-predicted
-        // visible cell with a 1 dB execution offset (3GPP NTN CHO
-        // execution-condition analogue, matched to the LTM hysteresis).
-        chosen = (candSinr > servSinr + 1.0 && candElev >= 10.0) ? g_candCellId
-                                                                 : g_servingCellId;
-    }
     if (chosen != g_serving && chosen != 0 && chosen != g_servingCellId)
     {
         ++g_handovers;
-        g_sinrAtHo = servSinr;
         g_cho->ExecuteHandover(chosen);
         const auto st = g_cho->GetMechanismStats();
         std::printf("  %6.1fs  HANDOVER cell %u -> %u  (servSINR meas=%.1f dB, candSINR "
-                    "pred=%.1f dB, interruption=%.1f ms)\n",
+                    "pred=%.1f dB, interruption=%.1f ms%s)\n",
                     Simulator::Now().GetSeconds(), g_serving, chosen, servSinr, candSinr,
-                    st.lastInterruptionMs);
+                    st.lastInterruptionMs,
+                    st.rachLessExecutions > 0 ? ", RACH-less" : "");
         g_serving = chosen;
+    }
+    if (g_evals % 5 == 0)
+    {
+        std::printf("  %6.1fs  servElev=%5.1f candElev=%5.1f  servSlant=%6.0fkm "
+                    "candSlant=%6.0fkm  measSINR=%6.2f dB\n",
+                    Simulator::Now().GetSeconds(), servElev, candElev, servSlant / 1e3,
+                    candSlant / 1e3, servSinr);
     }
     Simulator::Schedule(Seconds(1.0), &ChoTick);
 }
@@ -114,47 +132,44 @@ ChoTick()
 int
 main(int argc, char* argv[])
 {
-    double simSeconds = 60.0;
+    double duration = 60.0;
     uint32_t numUes = 2;
-    double leoAltKm = 550.0;
-    double freqGHz = 2.0;
+    double altitudeKm = 550.0;
     double satEirpDbm = 55.0;
+    double freqGhz = 2.0;
     double tteMinSec = 3.0;
-    std::string trigger = "tte-aware";
-    bool rachLess = false;
-    uint32_t satsPerPlane = 80;
-    std::string outputDir = "ntn-cho-handover-traffic-output";
+    std::string trigger = "pcho";
+    bool rachLess = true;
+    uint32_t satsPerPlane = 80; // 4.5 deg in-plane spacing -> ~500 km along-track
+    std::string outputDir = "ntn-cho-real-stack-output";
 
     CommandLine cmd(__FILE__);
-    cmd.AddValue("simSeconds", "Simulation duration (s)", simSeconds);
+    cmd.AddValue("duration", "Simulation duration (s)", duration);
     cmd.AddValue("numUes", "Number of TR 38.811 UEs on the serving cell", numUes);
-    cmd.AddValue("leoAltKm", "Constellation altitude (km)", leoAltKm);
-    cmd.AddValue("freqGHz", "Carrier frequency (GHz)", freqGHz);
+    cmd.AddValue("altitude", "Constellation altitude (km)", altitudeKm);
     cmd.AddValue("satEirpDbm", "Satellite EIRP / gNB Tx power (dBm)", satEirpDbm);
-    cmd.AddValue("tteMinSec", "Minimum TTE for CHO admission (s)", tteMinSec);
-    cmd.AddValue("trigger",
-                 "Handover trigger: tte-aware|ltm|pcho|a3|d1|t1|d2|elevation|ta "
-                 "(a3/d1/t1 = Rel-17 CondEvents, d2 = Rel-18 CondEventD2, "
-                 "elevation/ta = TR 38.821-studied mechanisms)",
-                 trigger);
+    cmd.AddValue("freqGhz", "Carrier frequency (GHz)", freqGhz);
+    cmd.AddValue("tteMin", "Minimum TTE for CHO admission (s)", tteMinSec);
+    cmd.AddValue("trigger", "Handover mechanism: tte-aware|ltm|pcho", trigger);
     cmd.AddValue("rachLess", "RACH-less execution (ephemeris TA pre-comp)", rachLess);
     cmd.AddValue("satsPerPlane", "Walker in-plane satellites (spacing)", satsPerPlane);
     cmd.AddValue("outputDir", "Output directory", outputDir);
     cmd.Parse(argc, argv);
-    g_simTime = simSeconds;
+    g_simTime = duration;
 
-    std::printf("# ntn-cho-handover-traffic (CHO on MEASURED SINR over REAL SGP4 orbits)\n"
-                "#   mechanism=%s%s  sim=%.0fs alt=%.0fkm freq=%.1fGHz EIRP=%.1fdBm\n",
-                trigger.c_str(), rachLess ? "+rachLess" : "", simSeconds, leoAltKm, freqGHz,
-                satEirpDbm);
+    std::cout << "\n=== ntn-cho REAL-STACK (real SGP4 orbits + TR 38.811 UEs) ===\n"
+              << "  serving + candidate: SGP4 Walker neighbours (real pass dynamics)\n"
+              << "  UEs: TR 38.811 class mobility (real ns-3 MobilityModel, ECEF)\n"
+              << "  mechanism: " << trigger << (rachLess ? " + RACH-less (RCHO)" : "")
+              << ", duration " << duration << " s\n\n";
 
-    // ---- Real Walker-Delta orbits (SGP4): serving + approaching neighbour ----
+    // ---- Real Walker-Delta orbits (SGP4) ----
     WalkerConfig wcfg;
     wcfg.num_planes = 1;
     wcfg.total_sats = satsPerPlane;
-    wcfg.altitude_km = leoAltKm;
+    wcfg.altitude_km = altitudeKm;
     wcfg.inclination_deg = 53.0;
-    wcfg.epoch_unix_s = 1735689600.0;
+    wcfg.epoch_unix_s = 1735689600.0; // 2025-01-01
     const auto elements = WalkerConstellation::BuildDelta(wcfg);
 
     Ptr<Sgp4MobilityModel> serv = CreateObject<Sgp4MobilityModel>();
@@ -164,17 +179,18 @@ main(int argc, char* argv[])
     Ptr<Sgp4MobilityModel> nbrB = CreateObject<Sgp4MobilityModel>();
     nbrB->SetElements(elements[satsPerPlane - 1]);
 
-    // ---- TR 38.811 UEs under the serving sat's t=0 sub-point ----
+    // ---- TR 38.811 UEs in a small box at the serving sat's t=0 sub-point ----
     double subLat, subLon, subAlt;
     serv->GetGeodetic(subLat, subLon, subAlt);
     NodeContainer ueNodes;
     ueNodes.Create(numUes);
-    NtnTr38811MobilityHelper ueMobility(1);
+    NtnTr38811MobilityHelper ueMobility(/*seed=*/1);
     auto profile = NtnMobilityScenarios::MixedContinental();
     auto ueModels = ueMobility.Install(ueNodes, profile, subLat - 0.03, subLat + 0.03,
                                        subLon - 0.03, subLon + 0.03);
     g_ueMob = ueModels[0];
 
+    // ---- Pick the genuinely APPROACHING in-plane neighbour as candidate ----
     const Vector ue0 = g_ueMob->GetPosition();
     auto approaching = [&ue0](Ptr<Sgp4MobilityModel> s) {
         const Vector p = s->GetPosition();
@@ -193,22 +209,22 @@ main(int argc, char* argv[])
     g_servMob = serv;
     g_candMob = cand;
 
-    // ---- Real mmwave NTN serving link + measured traffic ----
+    // ---- Real mmwave NTN serving cell + measured traffic ----
     NtnRealStackHelper rs;
-    rs.SetSimTime(Seconds(simSeconds));
+    rs.SetSimTime(Seconds(duration));
     rs.SetOutputDir(outputDir);
-    rs.SetRunTag("ntn-cho-handover-traffic");
-    rs.SetCarrierFrequencyHz(freqGHz * 1e9);
+    rs.SetRunTag("ntn-cho-real-stack");
+    rs.SetCarrierFrequencyHz(freqGhz * 1e9);
     rs.SetSatEirpDbm(satEirpDbm);
     rs.Build(servSat, ueNodes);
     rs.InstallTraffic(NtnRealStackHelper::TrafficProfile::EmbbStreaming,
-                      Seconds(1.0), Seconds(simSeconds - 0.5));
-    rs.EnableAiFlowMonitor("ntn-cho-handover-traffic"); // WS2 KPM series (TS 28.552 names)
+                      Seconds(1.0), Seconds(duration - 0.5));
+    rs.EnableAiFlowMonitor("ntn-cho-real-stack"); // WS2 KPM series (TS 28.552 names)
     g_rs = &rs;
 
-    // ---- CHO algorithm + mechanism ----
+    // ---- The CHO algorithm with the selected novel 6G mechanism ----
     Ptr<NtnChoHelper> choHelper = CreateObject<NtnChoHelper>();
-    choHelper->SetCarrierFrequency(freqGHz * 1e9);
+    choHelper->SetCarrierFrequency(freqGhz * 1e9);
     choHelper->SetSatelliteTxPower(satEirpDbm);
     choHelper->SetTteMinimum(Seconds(tteMinSec));
     g_cho = choHelper->CreateChoAlgorithm();
@@ -222,45 +238,16 @@ main(int argc, char* argv[])
     {
         cfg.triggerType = NtnChoAlgorithm::TRIGGER_TRAJECTORY_PREDICTIVE;
     }
-    else if (trigger == "a3") // 3GPP class 1: measurement-based
-    {
-        cfg.triggerType = NtnChoAlgorithm::TRIGGER_EVENT_A3;
-    }
-    else if (trigger == "d1") // class 2: location-based (CondEventD1)
-    {
-        cfg.triggerType = NtnChoAlgorithm::TRIGGER_LOCATION_D1;
-    }
-    else if (trigger == "t1") // class 3: time-based (CondEventT1, ephemeris)
-    {
-        cfg.triggerType = NtnChoAlgorithm::TRIGGER_TIME_T1;
-    }
-    else if (trigger == "elevation") // class 4: elevation-based
-    {
-        cfg.triggerType = NtnChoAlgorithm::TRIGGER_ELEVATION;
-    }
-    else if (trigger == "ta") // class 5: timing-advance-based
-    {
-        cfg.triggerType = NtnChoAlgorithm::TRIGGER_TIMING_ADVANCE;
-    }
-    else if (trigger == "d2") // Rel-18 CondEventD2: moving reference locations
-    {
-        cfg.triggerType = NtnChoAlgorithm::TRIGGER_DISTANCE_D2;
-        // Scenario-tuned thresholds (set per cell pair by the network in a
-        // real deployment): the serving moving reference must have receded
-        // 250 km from the UE (the serving sub-point starts at zenith and
-        // recedes at the ~7.6 km/s ground-track speed), while the candidate
-        // moving reference must be within 2000 km.
-        cfg.d2Thresh1_m = 250e3;
-        cfg.d2Thresh2_m = 2000e3;
-    }
     else
     {
         cfg.triggerType = NtnChoAlgorithm::TRIGGER_TTE_AWARE;
     }
-    cfg.orbitAltitudeKm = leoAltKm;
     cfg.rachLess = rachLess;
     cfg.tteMinimum = Seconds(tteMinSec);
+    // PCHO outage threshold sits just under the opening measured SINR so the
+    // genuinely-declining pass crosses it during the run.
     cfg.qualityThreshold_dB = 8.0;
+    cfg.predictionHorizon = Seconds(8.0);
     cfg.minPredictedTos = Seconds(3.0);
     g_cho->Configure(cfg);
 
@@ -275,17 +262,26 @@ main(int argc, char* argv[])
 
     Simulator::Schedule(Seconds(1.0), &ChoTick);
 
-    Simulator::Stop(Seconds(simSeconds));
+    Simulator::Stop(Seconds(duration));
     Simulator::Run();
     rs.Collect();
     rs.WriteHealthReport();
 
     const auto st = g_cho->GetMechanismStats();
-    std::printf("# === summary ===  handovers=%u (%s on measured SINR, real orbits)  "
-                "serving-cell measured goodput=%.3f Mbps  mean SINR=%.2f dB  "
-                "SINR@handover=%.2f dB  interruption(last)=%.1f ms  rachless=%u  final cell=%u\n",
-                g_handovers, trigger.c_str(), rs.GetRxThroughputMbps(), rs.GetMeanDlSinrDb(),
-                g_sinrAtHo, st.lastInterruptionMs, st.rachLessExecutions, g_serving);
+    std::cout << "\n--- CHO Summary (novel 6G mechanisms on REAL orbits + MEASURED SINR) ---\n"
+              << "  mechanism:                    " << trigger
+              << (rachLess ? " + RACH-less" : "") << "\n"
+              << "  measured serving SINR (mean): " << rs.GetMeanDlSinrDb() << " dB\n"
+              << "  measured DL throughput:       " << rs.GetRxThroughputMbps() << " Mbps\n"
+              << "  CHO evaluations:              " << g_evals << "\n"
+              << "  handovers executed:           " << g_handovers << "\n"
+              << "  LTM fast switches:            " << st.ltmSwitches << "\n"
+              << "  PCHO trajectory triggers:     " << st.pchoTriggers << "\n"
+              << "  RACH-less executions:         " << st.rachLessExecutions << " (RACH paid: "
+              << st.rachExecutions << ")\n"
+              << "  last interruption:            " << st.lastInterruptionMs << " ms\n"
+              << "  last pre-computed TA:         " << st.lastPreCompTaUs << " us (ephemeris)\n"
+              << "  final serving cell:           " << g_serving << "\n";
 
     Simulator::Destroy();
     return 0;

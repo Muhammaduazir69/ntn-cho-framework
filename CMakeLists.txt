@@ -4,9 +4,11 @@ set(source_files
     model/ntn-cho-algorithm.cc
     model/ntn-measurement-model.cc
     model/ntn-ai-interface.cc
+    # Real 3GPP TR 38.811 UE-class mobility as an ns-3 MobilityModel (ECEF,
+    # SGP4-compatible) -- the toolkit's core NTN UE mobility architecture.
+    model/ntn-tr38811-mobility-model.cc
     helper/ntn-cho-helper.cc
     helper/ntn-realistic-mobility.cc
-    helper/ntn-realistic-traffic-helper.cc
 )
 
 set(header_files
@@ -15,20 +17,21 @@ set(header_files
     model/ntn-cho-algorithm.h
     model/ntn-measurement-model.h
     model/ntn-ai-interface.h
+    model/ntn-tr38811-mobility-model.h
     helper/ntn-cho-helper.h
     helper/ntn-realistic-mobility.h
-    helper/ntn-realistic-traffic-helper.h
 )
 
 set(test_sources
     test/ntn-cho-test-suite.cc
+    test/ntn-standards-validation-test.cc
 )
 
 # ns3-ai is an OPTIONAL dependency: only NtnAiInterface (the learning-based
 # HO path) uses it. Detect whichever ns3-ai target is present — the upstream
 # module (libns3-ai) or the ns3-ntn-toolkit fork (libns3-ai-ntn) — and only
 # then link it and define NTN_CHO_HAS_NS3AI so the bridge is compiled in.
-# Without it, the C++ CHO baselines (a3 / location / time / tte-aware) build
+# Without it, the C++ CHO triggers (a3 / location / time / tte-aware) build
 # and run unchanged.
 set(ntn_cho_optional_libs "")
 if(TARGET ${libns3-ai})
