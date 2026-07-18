@@ -129,9 +129,24 @@ NtnTteEstimator::ComputeTte(GeoCoordinate uePosition,
         // Project UE position (for mobile UEs)
         GeoCoordinate projectedUe = ProjectUePosition(uePosition, ueVelocity, t);
 
-        // Get beam gain at projected time/position
-        // The satellite position is automatically updated by SGP4 model
-        double gain = m_orbitPredictor->ComputeBeamGain(satId, beamId, projectedUe);
+        // ---- GAP C1 FIX: advance the SATELLITE too ------------------------
+        // This used to call ComputeBeamGain(satId, beamId, projectedUe), whose
+        // comment claimed "the satellite position is automatically updated by
+        // the SGP4 model". It is not: simulation time does not advance inside a
+        // single event, so every iteration of this loop evaluated the gain with
+        // the satellite frozen at Simulator::Now(). For a static UE the gain was
+        // therefore IDENTICAL at every step, the exit was never found, and this
+        // function returned TTE == m_maxPredictionWindow (120 s) for every beam
+        // — making the TTE-aware admission (tte >= tteMinimum) always true and
+        // condEventT1 (serving TTE <= window) unreachable. The headline
+        // mechanism was a constant.
+        //
+        // GetBeamSnapshotAtTime propagates the satellite to t+dt and (since the
+        // C1 fix in NtnOrbitPredictor) evaluates the body-fixed beam pattern at
+        // that propagated geometry.
+        const NtnOrbitPredictor::BeamSnapshot snap =
+            m_orbitPredictor->GetBeamSnapshotAtTime(satId, beamId, projectedUe, t);
+        double gain = snap.gainAtUe_dB;
 
         if (gain > result.peakGain_dB)
         {
@@ -305,8 +320,15 @@ NtnTteEstimator::FindBeamExitTime(GeoCoordinate uePos,
         }
 
         Time tMid = Seconds((tGood.GetSeconds() + tBad.GetSeconds()) / 2.0);
-        GeoCoordinate midPos = uePos; // For static UEs; projected for mobile
-        double gain = m_orbitPredictor->ComputeBeamGain(satId, beamId, midPos);
+        // GAP C1 (refinement half): propagate the SATELLITE to tMid via a beam
+        // snapshot — exactly as the coarse search (line ~148) and the sibling
+        // FindDistanceExitTime (line ~356) do. The old code called
+        // ComputeBeamGain(satId, beamId, uePos) with no time, so the gain was
+        // frozen at Simulator::Now() across the whole binary search: it never
+        // crossed the threshold and the refinement collapsed to the upper
+        // bracket (tBad), silently returning the coarse-grid granularity instead
+        // of a refined exit time. Evaluating at tMid makes the search real.
+        double gain = m_orbitPredictor->GetBeamSnapshotAtTime(satId, beamId, uePos, tMid).gainAtUe_dB;
 
         if (gain >= threshold_dB)
         {
