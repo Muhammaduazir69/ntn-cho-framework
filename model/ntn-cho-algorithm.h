@@ -158,6 +158,85 @@ class NtnChoAlgorithm : public Object
         Time t304Timer = Seconds(2.0);        //!< CHO execution timer
         double gainThreshold_dB = -3.0;       //!< Beam gain threshold for TTE computation
         Time tteEpsilon = Seconds(2.0);       //!< TTE tie-breaking window
+
+        /// A19: require a candidate to BEAT the serving cell's own time-to-exit
+        /// before handing over, so an equal predicted time-of-stay does not pay
+        /// for the cost of a handover.
+        ///
+        /// The selection rule never read the serving cell's TTE at all, and the
+        /// serving cell is excluded from the candidate map, so the comparison
+        /// could not happen even implicitly. Measured consequence on
+        /// ntn-cho-full-constellation: at the first decision tick the terminal
+        /// left a satellite at 87 degrees elevation for one at 51 degrees with
+        /// 1.8 dB less SINR, with tte_target and tte_serving BOTH saturated at
+        /// the 120 s prediction horizon. Facing a tie it could not see, the
+        /// policy switched.
+        ///
+        /// Set false to reproduce the pre-2026-09-02 behaviour for comparison.
+        bool requireBetterThanServing = true;
+        /**
+         * Gate time-to-exit admission on the D1 location condition.
+         *
+         * TRIGGER_TTE_AWARE was built as "D1 plus a time-to-exit filter", so a
+         * candidate had to satisfy CondEventD1 before its exit time was even
+         * computed. D1 measures the terminal against a FIXED reference location
+         * (TS 38.331 5.5.4.15), which suits quasi-Earth-fixed cells and does
+         * not describe an Earth-moving cell at all. Set false to admit on
+         * quality and time-to-exit alone. Default true keeps the original
+         * behaviour.
+         */
+        bool tteRequireD1 = true;
+        /**
+         * Execute only when the SERVING cell is about to be lost.
+         *
+         * With this false, the time-to-exit rule switches as soon as some
+         * candidate is predicted to outlast the serving cell, which hands over
+         * early and repeatedly while the terminal is still well served. With it
+         * true the rule waits until the serving cell's own predicted
+         * time-to-exit falls to tteExitMargin (or its quality falls below
+         * qualityThreshold_dB) and then takes the admissible candidate with the
+         * longest predicted time-to-exit. Under exact prediction that greedy
+         * choice covers a pass with the fewest handovers, which is why it is
+         * offered as a policy rather than as a tuning of the eager rule.
+         */
+        bool tteExitTriggered = false;
+        /**
+         * Serving time-to-exit at or below which an exit-triggered handover is
+         * executed. It has to cover the execution latency plus the prediction
+         * error of the ephemeris in use; a margin that only covers the former
+         * converts every early prediction error into a radio link failure.
+         */
+        Time tteExitMargin = Seconds(5.0);
+        /**
+         * The network's own ephemeris uncertainty, one sigma per RTN axis, in
+         * metres. When any is non-zero the exit-triggered margin grows by
+         * tteMarginZ standard deviations of the serving cell's predicted exit
+         * time (NtnTteEstimator::ComputeTteSigma), computed for the pass the
+         * terminal is actually on. Zero (the default) leaves the margin at
+         * tteExitMargin.
+         */
+        double ephSigmaRadialM = 0.0;
+        double ephSigmaAlongM = 0.0;
+        double ephSigmaCrossM = 0.0;
+        /// One-sided confidence multiplier on the exit-time sigma (2 covers ~97.7 %).
+        double tteMarginZ = 2.0;
+        /**
+         * Serving quality below which an exit-triggered rule hands over at
+         * once, whatever the predicted exit says. This is a link-loss safety
+         * net, not the candidate quality floor: tying it to qualityThreshold_dB
+         * makes a demanding floor fire on a perfectly usable serving cell at
+         * every evaluation, and the rule degenerates into ping-pong. The default
+         * sits at the radio-link Qin level.
+         */
+        double tteServingFloor_dB = -6.0;
+        /**
+         * How long the serving cell must stay below tteServingFloor_dB before
+         * the safety net fires. Blockage is not predictable from an ephemeris,
+         * so an exit-triggered rule has to fall back on measurements for it,
+         * and a measurement trigger without a time-to-trigger reacts to every
+         * shadowing dip. Zero keeps the immediate behaviour.
+         */
+        Time tteServingFloorTtt = Seconds(0);
         double a3Offset_dB = 3.0;             //!< A3 event offset (for baseline)
         Time a3TimeToTrigger = MilliSeconds(160); //!< A3 TTT (for baseline)
 
@@ -346,6 +425,7 @@ class NtnChoAlgorithm : public Object
         bool admitted = false;            //!< Passed TTE + quality filter
         Time lastUpdate = Seconds(0);     //!< Last measurement update time
         Time a4MetSince = Seconds(-1.0);  //!< When the A4 quality condition was first met (-1 = not met)
+        Time a3MetSince = Seconds(-1.0);  //!< When the A3 entering inequality was first met (-1 = not met)
 
         // ---- Rel-19 conditional LTM state ----
         /**
@@ -498,6 +578,21 @@ class NtnChoAlgorithm : public Object
     void StartMonitoring(GeoCoordinate uePosition, Vector ueVelocity);
 
     /**
+     * \brief Refresh the UE kinematics the geometric triggers evaluate against.
+     *
+     * StartMonitoring() also seeds these, but it transitions state and starts a
+     * self-scheduling evaluation loop, so a scenario that drives
+     * EvaluateConditions() on its own cadence cannot use it to keep the UE
+     * position current. Without a call to one of the two, D1, D2, T1 and the
+     * TTE estimator evaluate against a default-constructed position while the
+     * radio flies the real one.
+     *
+     * \param uePosition current UE position
+     * \param ueVelocity current UE velocity
+     */
+    void UpdateUeKinematics(GeoCoordinate uePosition, Vector ueVelocity);
+
+    /**
      * \brief Stop condition monitoring
      */
     void StopMonitoring();
@@ -571,6 +666,28 @@ class NtnChoAlgorithm : public Object
     bool SetCandidateReferenceIsSatellite(uint16_t cellId, bool isSatellite);
     /// What a candidate's D2 reference currently resolves to.
     bool GetCandidateReferenceIsSatellite(uint16_t cellId) const;
+
+    /**
+     * \brief The algorithm's own admission verdict for one candidate.
+     *
+     * Reports what EvaluateConditions() actually decided, so a scenario can log
+     * the algorithm's state instead of recomputing an admission rule beside it.
+     * A parallel oracle cannot disagree with itself, which is how a run can
+     * write a file full of admitted candidates while the algorithm admitted
+     * none.
+     *
+     * \param cellId candidate cell
+     * \return true if the candidate is currently admitted
+     */
+    bool IsCandidateAdmitted(uint16_t cellId) const;
+
+    /**
+     * \brief The time-to-exit the algorithm currently holds for a candidate.
+     *
+     * \param cellId candidate cell
+     * \return the stored TTE, or zero if the cell is not a candidate
+     */
+    Time GetCandidateTte(uint16_t cellId) const;
     /// Test seam: the D2 moving-reference distance for a candidate, so the
     /// reference KIND can be checked without standing up a full D2 evaluation.
     double DistanceToMovingReferenceForTest(uint16_t cellId) const;
@@ -638,6 +755,9 @@ class NtnChoAlgorithm : public Object
      */
     ChoState GetState() const;
 
+    /// Exit margin the last exit-triggered evaluation applied (base + z sigma).
+    Time GetLastExitMargin() const { return m_lastExitMargin; }
+
     /**
      * \brief Get information about all candidates
      */
@@ -701,6 +821,8 @@ class NtnChoAlgorithm : public Object
     double DistanceToMovingReference(const CandidateInfo& cand) const;
 
     ChoState m_state;                                  //!< Current state
+    mutable Time m_servingBelowFloorSince{Seconds(-1)}; //!< serving below tteServingFloor_dB since
+    mutable Time m_lastExitMargin{Seconds(0)}; //!< last exit-triggered margin applied
     ChoConfig m_config;                                //!< Configuration
     std::map<uint16_t, CandidateInfo> m_candidates;    //!< cellId -> CandidateInfo
     uint16_t m_servingCellId;                          //!< Current serving cell
@@ -757,6 +879,17 @@ class NtnChoAlgorithm : public Object
     void EvaluateLtmConditional(CandidateInfo& cand);
     /// Standardized NTN trigger classes (TIME_T1 / ELEVATION / TIMING_ADVANCE).
     void EvaluateStandardNtnTrigger(CandidateInfo& cand);
+
+    /**
+     * \brief Evaluate the TS 38.331 CondEventA3 entering condition for one candidate.
+     *
+     * Mn + Ofn + Ocn - Hys > Mp + Ofp + Ocp + Off, held for a3TimeToTrigger.
+     * A3 is a pure measurement event: it does not involve the D1 location
+     * condition and it computes no time-to-exit.
+     *
+     * \param cand the candidate to evaluate, admitted in place
+     */
+    void EvaluateEventA3(CandidateInfo& cand);
     /// CHO-14: TRIGGER_TIME_BASED. Admit once the UE has dwelt on its serving
     /// beam for Config::beamDwellThreshold and the candidate is usable.
     void EvaluateBeamDwell(CandidateInfo& cand);

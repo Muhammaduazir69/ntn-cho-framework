@@ -86,6 +86,26 @@ NtnRealStackHelper* g_rs = nullptr;
 // CHO-3: handover outcomes as reported by the RRC, not asserted by the model.
 // GetHandoverCount() counts NrGnbRrc HandoverEndOk completions.
 uint32_t g_hoCompletionsSeen = 0;
+// A20: a handover's verdict cannot be read on the statement that requests it.
+// TriggerHandover issues an RRC reconfiguration-with-sync and GetHandoverCount
+// counts HandoverEndOk, which cannot have arrived yet, so the old synchronous
+// check made success false by construction (and the version before it hardcoded
+// true, making it 100 percent by construction). The verdict is now resolved on
+// the following decision tick, by which time a completion has had a full tick to
+// arrive and can be attributed to the request that caused it.
+bool g_hoPending = false;
+bool g_hoPendingRequested = false;
+std::string g_hoPendingPrefix;  // event row up to the success column
+std::string g_hoPendingSuffix;  // event row after the ping-pong column
+bool g_hoPendingIsPP = false;
+// A20b: the verdict comes from the RRC's own HandoverEndOk for the TARGET cell,
+// which is the pattern ntn-cho-real-stack already used. A cumulative counter
+// only says "some handover finished"; the trace says which one.
+uint16_t g_hoPendingTarget = 0;
+bool g_hoPendingCompleted = false;
+bool g_lastActuationAccepted = false;
+std::string g_hoPendingGeoPre;   // geojson feature up to the success value
+std::string g_hoPendingGeoPost;  // geojson feature after it
 Ptr<NtnChoAlgorithm> g_cho;
 Ptr<NtnChoHelper> g_choHelper;
 Ptr<NtnOrbitPredictor> g_orbit;
@@ -116,6 +136,8 @@ std::vector<uint32_t> g_candBeamIds;      // aux geo-33E beam id per candidate (
 const GeoCoordinate kAuxRefPos(49.75, 3.75, 0.0);
 
 uint32_t g_totalHos = 0;
+uint32_t g_admitTicks = 0; // decision ticks where the algorithm admitted a candidate
+double g_minServElevDeg = 1e9; // lowest serving elevation seen, for the D1 sizing hint
 uint32_t g_successHos = 0;
 uint32_t g_failedHos = 0;
 uint32_t g_ppCount = 0;
@@ -178,6 +200,7 @@ ChoTick()
     const Vector u = g_ueModels[0]->GetPosition(); // TR 38.811 UE, ECEF
     const Vector sPos = g_servSat->GetPosition();  // Kepler+J2 serving sat, ECEF
     const double servElev = ntngeo::ElevationDeg(u, sPos);
+    g_minServElevDeg = std::min(g_minServElevDeg, servElev);
     const double servSlant = ntngeo::SlantRangeM(u, sPos);
 
     // Serving SINR is MEASURED from the real mmwave PHY (UE 0).
@@ -284,6 +307,35 @@ ChoTick()
     // keeps the GEO antenna-pattern search off the critical per-second path.
     const bool decisionTick = (std::fmod(t, 5.0) < g_dt);
 
+    // Evaluate the CHO conditions BEFORE the TTE oracle writes its file, so the
+    // cho_admitted column records this tick's verdict rather than the previous
+    // tick's leftover state.
+    //
+    // CHO-21: the algorithm was also deciding for a different terminal than the
+    // one this scenario simulates. StartMonitoring seeded m_uePosition once with
+    // the fixed kAuxRefPos and nothing updated it, while the oracle below runs
+    // on g_ueModels[0]'s live position, so D1 measured a stationary point
+    // against moving references.
+    if (decisionTick)
+    {
+        // GeoCoordinate defaults to a SPHERICAL Earth, while GetGeodetic returns
+        // WGS84 latitude and height, so building one from the other moved the
+        // terminal by about 19 km at 30 degrees latitude. Build it from the
+        // ECEF vector instead, which round-trips exactly.
+        g_cho->UpdateUeKinematics(GeoCoordinate(g_ueModels[0]->GetPosition()),
+                                  g_ueModels[0]->GetVelocity());
+        g_cho->EvaluateConditions();
+        for (const uint16_t cid : g_candCellIds)
+        {
+            if (g_cho->IsCandidateAdmitted(cid))
+            {
+                ++g_admitTicks;
+                break;
+            }
+        }
+    }
+
+
     std::map<uint16_t, double> tteByCell;
     if (decisionTick && g_tte && !beamInfos.empty())
     {
@@ -297,11 +349,8 @@ ChoTick()
         // time-to-exit was zero: the oracle reported the exit time of a
         // terminal that was never in the beam. Use the UE's own position and
         // velocity, which is what a time-to-exit is defined against.
-        double ueLatT = 0.0;
-        double ueLonT = 0.0;
-        double ueAltT = 0.0;
-        g_ueModels[0]->GetGeodetic(ueLatT, ueLonT, ueAltT);
-        const GeoCoordinate ueGeoNow(ueLatT, ueLonT, ueAltT);
+        // Spherical GeoCoordinate from the ECEF vector, not from WGS84 geodetic.
+        const GeoCoordinate ueGeoNow(g_ueModels[0]->GetPosition());
         // CHO-2b: the threshold must be on the quantity the search examines,
         // which is antenna gain. g_qualityTh is a SINR threshold (default
         // -3 dB); against a 26 to 29 dB steered-beam gain it can never be
@@ -318,6 +367,8 @@ ChoTick()
                       << ",0," << r.cellId << "," << std::setprecision(2)
                       << r.tte.GetSeconds() << "," << r.currentGain_dB << ","
                       << r.peakGain_dB << ","
+                      << (g_cho->IsCandidateAdmitted(r.cellId) ? 1 : 0) << ","
+                      << g_cho->GetCandidateTte(r.cellId).GetSeconds() << ","
                       << ((r.currentSinr_dB >= g_qualityTh &&
                            r.tte.GetSeconds() >= g_tteMinimum)
                               ? 1
@@ -375,11 +426,39 @@ ChoTick()
         }
     }
 
+    // A20: resolve the previous tick's handover before deciding a new one.
+    if (decisionTick && g_hoPending)
+    {
+        // Attribute on the RRC trace for the target cell, not on a counter.
+        const bool ok = g_hoPendingRequested && g_hoPendingCompleted;
+        g_hoCompletionsSeen = g_rs->GetHandoverCount();
+        if (ok)
+        {
+            ++g_successHos;
+        }
+        else
+        {
+            ++g_failedHos;
+        }
+        g_hoFile << g_hoPendingPrefix << (ok ? 1 : 0) << "," << (g_hoPendingIsPP ? 1 : 0)
+                 << g_hoPendingSuffix
+                 << (ok ? "" : (g_hoPendingRequested ? "no-rrc-completion-observed"
+                                                     : "radio-refused-request"))
+                 << "\n";
+        if (!g_fHo)
+        {
+            g_hoGeo << ",\n";
+        }
+        g_hoGeo << g_hoPendingGeoPre << (ok ? "true" : "false") << g_hoPendingGeoPost;
+        g_fHo = false;
+        g_hoPending = false;
+    }
+
     // ---- Real CHO decision (algorithm state machine + baselines) ----
     uint16_t chosen = 0;
     if (decisionTick)
     {
-        g_cho->EvaluateConditions();
+        // Conditions were evaluated above, before the TTE file write.
         if (g_algorithm == "a3-baseline")
         {
             chosen = g_cho->SelectBaselineA3(servSinr);
@@ -397,7 +476,6 @@ ChoTick()
     if (chosen != 0 && chosen != g_serving && chosen != g_servingCellId)
     {
         ++g_totalHos;
-        g_cho->ExecuteHandover(chosen);
         const auto st = g_cho->GetMechanismStats();
         // CHO-3 FIX (2026-08-24): ask the radio whether the handover happened.
         //
@@ -408,21 +486,16 @@ ChoTick()
         // genuine reconfiguration-with-sync through TriggerHandover, and the
         // outcome is the radio's word: the RRC confirms completion through
         // HandoverEndOk, which is what g_rrcConfirmed counts.
-        const bool requested = g_rs->TriggerHandover(0, chosen);
-        const uint32_t completions = g_rs->GetHandoverCount();
-        const bool success = requested && (completions > g_hoCompletionsSeen);
-        g_hoCompletionsSeen = completions;
+        // A21: actuate THROUGH the algorithm so ExecuteHandover stops taking its
+        // "no radio wired" branch, where it logs that nothing was actuated and
+        // self-completes every handover as a success.
+        g_lastActuationAccepted = false;
+        g_cho->ExecuteHandover(chosen);
+        const bool requested = g_lastActuationAccepted;
+        // Do NOT grade it here; the verdict resolves one decision tick later.
         const double tos = (g_lastHoTime >= 0.0) ? (t - g_lastHoTime) : t;
         const bool isPP =
             (g_lastHoTime >= 0.0 && chosen == g_lastSourceCell && tos < 10.0);
-        if (success)
-        {
-            ++g_successHos;
-        }
-        else
-        {
-            ++g_failedHos;
-        }
         if (isPP)
         {
             ++g_ppCount;
@@ -447,29 +520,57 @@ ChoTick()
             ttePred = itTte->second;
         }
 
-        g_hoFile << std::fixed << std::setprecision(3) << t << ",0,"
-                 << g_serving << "," << chosen << "," << g_servSatId << ","
-                 << chosen << ",0,0," << g_algorithm << ","
-                 << std::setprecision(2) << servSinr << "," << tgtSinr << ","
-                 << ttePred << "," << tos << "," << (success ? 1 : 0) << ","
-                 << (isPP ? 1 : 0) << "," << std::setprecision(6) << ueLat << ","
-                 << ueLon << ",0," << g_ueModels[0]->GetClassName() << ","
-                 << std::setprecision(1) << servElev << "," << tgtElev << ",\n";
-
-        if (!g_fHo)
+        // A20: buffer the row and emit it when the verdict resolves next tick.
         {
-            g_hoGeo << ",\n";
+            std::ostringstream pre, suf;
+            suf << std::fixed;
+            pre << std::fixed << std::setprecision(3) << t << ",0,"
+                << g_serving << "," << chosen << "," << g_servSatId << ","
+                << chosen << ",0,0," << g_algorithm << ","
+                << std::setprecision(2) << servSinr << "," << tgtSinr << ","
+                << ttePred << "," << tos << ",";
+            // A19: the serving cell's own time-to-exit, computed with the same
+            // estimator and threshold the candidates were ranked by, so the two
+            // are directly comparable.
+            double servTte = -1.0;
+            if (g_tte)
+            {
+                const auto r = g_tte->ComputeTte(GeoCoordinate(g_ueModels[0]->GetPosition()),
+                                                 g_ueModels[0]->GetVelocity(),
+                                                 g_servSatId,
+                                                 0,
+                                                 g_orbit ? g_orbit->GainThresholdForMinElevationDb(
+                                                               10.0, g_leoAltM)
+                                                         : 0.0);
+                servTte = r.tte.GetSeconds();
+            }
+            suf << "," << std::setprecision(6) << ueLat << ","
+                << ueLon << ",0," << g_ueModels[0]->GetClassName() << ","
+                << std::setprecision(1) << servElev << "," << tgtElev << ","
+                << std::setprecision(2) << servTte << ",";
+            g_hoPendingPrefix = pre.str();
+            g_hoPendingSuffix = suf.str();
+            g_hoPendingIsPP = isPP;
+            g_hoPendingRequested = requested;
+            g_hoPendingTarget = chosen;
+            g_hoPendingCompleted = false;
+            g_hoPending = true;
         }
-        g_hoGeo << "{\"type\":\"Feature\",\"properties\":{\"ueId\":0,\"time\":"
-                << std::setprecision(1) << t << ",\"sourceCell\":" << g_serving
-                << ",\"targetCell\":" << chosen
-                << ",\"success\":" << (success ? "true" : "false")
-                << ",\"pingPong\":" << (isPP ? "true" : "false") << ",\"algorithm\":\""
-                << g_algorithm << "\",\"tte\":" << std::setprecision(2) << ttePred
-                << ",\"sinrBefore\":" << servSinr << ",\"sinrAfter\":" << tgtSinr
-                << "},\"geometry\":{\"type\":\"Point\",\"coordinates\":["
-                << std::setprecision(6) << ueLon << "," << ueLat << "]}}";
-        g_fHo = false;
+
+        // A20: the geojson carries the same verdict, so it is buffered too.
+        {
+            std::ostringstream gpre, gpost;
+            gpre << "{\"type\":\"Feature\",\"properties\":{\"ueId\":0,\"time\":"
+                 << std::setprecision(1) << t << ",\"sourceCell\":" << g_serving
+                 << ",\"targetCell\":" << chosen << ",\"success\":";
+            gpost << ",\"pingPong\":" << (isPP ? "true" : "false") << ",\"algorithm\":\""
+                  << g_algorithm << "\",\"tte\":" << std::setprecision(2) << ttePred
+                  << ",\"sinrBefore\":" << servSinr << ",\"sinrAfter\":" << tgtSinr
+                  << "},\"geometry\":{\"type\":\"Point\",\"coordinates\":["
+                  << std::setprecision(6) << ueLon << "," << ueLat << "]}}";
+            g_hoPendingGeoPre = gpre.str();
+            g_hoPendingGeoPost = gpost.str();
+        }
 
         std::printf("  %6.1fs  HANDOVER cell %u -> %u  (servSINR meas=%.1f dB, candSINR "
                     "pred=%.1f dB, TTE=%.1fs, interruption=%.1f ms%s)\n",
@@ -602,7 +703,8 @@ main(int argc, char* argv[])
     double d1Threshold = 50000;
     double qualityTh = -3.0;
     double tteMinimum = 20.0;
-    double carrierFreqGhz = 2.0;
+    double carrierFreqGhz = 2.185; // TS 38.101-5 n256 downlink block (2170-2200 MHz). Was 2.0,
+                              // which is n256 UPLINK and never conformant as a DL carrier.
     double satTxPower = -1.0; // sentinel: backend-appropriate default chosen below
     double altitudeKm = 780.0;
     std::string radio = "nr"; // radio backend: "nr" (5G-LENA FR1, 30 kHz SCS) | "mmwave" (FR2)
@@ -779,6 +881,33 @@ main(int argc, char* argv[])
     // defines it for.
     rs.SetKOffsetConsumption(true);
     rs.Build(gnbSats, ueNodes);
+    // A20b: take the verdict from the radio's own completion event, for the cell
+    // the handover was aimed at. ntn-cho-real-stack already binds this trace;
+    // this scenario inferred the outcome from a cumulative counter instead,
+    // which cannot tell which handover finished when more than one is in flight.
+    Config::Connect("/NodeList/*/DeviceList/*/NrGnbRrc/HandoverEndOk",
+                    MakeCallback(+[](std::string /*ctx*/, uint64_t /*imsi*/, uint16_t cellId,
+                                     uint16_t /*rnti*/) {
+                        if (g_hoPending && cellId == g_hoPendingTarget)
+                        {
+                            g_hoPendingCompleted = true;
+                        }
+                        // A21: hand the outcome to the algorithm OFF THE STACK.
+                        // Calling NotifyHandoverComplete inline from this trace
+                        // re-enters the algorithm while ExecuteHandover is still
+                        // unwinding and mutates the candidate map underneath it,
+                        // which segfaulted every seed. ScheduleNow runs it in the
+                        // same simulated instant with the stack unwound.
+                        if (g_cho)
+                        {
+                            Simulator::ScheduleNow([cellId]() {
+                                if (g_cho)
+                                {
+                                    g_cho->NotifyHandoverComplete(cellId, true);
+                                }
+                            });
+                        }
+                    }));
     rs.InstallTraffic(NtnRealStackHelper::TrafficProfile::EmbbStreaming, Seconds(1.0),
                       Seconds(simTime - 0.5));
     rs.EnableAiFlowMonitor(outputDir + "/ntn-cho-full-constellation");
@@ -792,6 +921,21 @@ main(int argc, char* argv[])
     g_choHelper->SetD1Threshold(d1Threshold);
     g_choHelper->SetQualityThreshold(qualityTh);
     g_cho = g_choHelper->CreateChoAlgorithm();
+
+    // A21: the algorithm actuates the radio, as ntn-cho-real-stack does.
+    g_cho->SetHandoverExecutionCallback(
+        MakeCallback(+[](uint16_t /*from*/, uint16_t to) {
+            g_lastActuationAccepted = g_rs->TriggerHandover(0, to);
+            if (!g_lastActuationAccepted)
+            {
+                Simulator::ScheduleNow([to]() {
+                    if (g_cho)
+                    {
+                        g_cho->NotifyHandoverComplete(to, false);
+                    }
+                });
+            }
+        }));
 
     NtnChoAlgorithm::ChoConfig cfg = g_cho->GetConfig();
     cfg.triggerType = TriggerFor(algorithm);
@@ -973,14 +1117,20 @@ main(int argc, char* argv[])
     g_hoFile << "time_s,ue_id,source_cell,target_cell,source_sat,target_sat,"
              << "source_beam,target_beam,algorithm,sinr_before_dB,sinr_after_dB,"
              << "tte_predicted_s,time_of_stay_s,success,ping_pong,ue_lat,ue_lon,"
-             << "ue_speed_mps,mobility_type,elevation_before,elevation_after,failure_reason\n";
+             << "ue_speed_mps,mobility_type,elevation_before,elevation_after,"
+             // A19: what the terminal gave up. The selection rule never computes
+             // the serving cell's own time-to-exit, so a reader could not tell
+             // whether staying would have lasted longer than switching. The
+             // decision is unchanged; the number it would need is now recorded.
+             << "serving_tte_s,failure_reason\n";
     g_measFile.open(outputDir + "/measurements.csv");
     g_measFile << "time_s,ue_id,sat_id,beam_id,cell_id,rsrp_dBm,sinr_dB,"
                << "path_loss_dB,antenna_gain_dB,elevation_deg,range_km,"
                << "doppler_Hz,propagation_delay_ms,ue_lat,ue_lon\n";
     g_tteFile.open(outputDir + "/tte_computations.csv");
     g_tteFile << "time_s,ue_id,sat_id,beam_id,cell_id,tte_predicted_s,"
-              << "current_gain_dB,peak_gain_dB,admitted,trigger_type\n";
+              << "current_gain_dB,peak_gain_dB,cho_admitted,cho_tte_s,oracle_admitted,"
+              << "trigger_type\n";
     g_satTrackFile.open(outputDir + "/satellite_tracks.csv");
     g_satTrackFile << "time_s,sat_id,lat,lon,altitude_km,velocity_mps\n";
     g_ueTrackFile.open(outputDir + "/ue_tracks.csv");
@@ -1051,6 +1201,39 @@ main(int argc, char* argv[])
 
     // KPI summary (HO counts from the real algorithm, avg SINR measured).
     const double measSinrMean = rs.GetMeanDlSinrDb();
+    // A trigger that admitted nothing for an entire run must say so. Without
+    // this the run writes a full set of plausible CSVs, reports a 100 percent
+    // success rate over zero handovers, and looks like a mobility result.
+    if (g_admitTicks == 0)
+    {
+        std::cout << "\n  WARNING: the CHO algorithm admitted no candidate on any decision tick.\n"
+                  << "           No handover in this run came from the " << g_algorithm
+                  << " trigger.\n"
+                  << "           The usual cause is d1Threshold (" << (g_d1Threshold / 1000.0)
+                  << " km) being sized like a beam footprint while the D1 reference\n"
+                  << "           is the sub-satellite point, which at this altitude is "
+                  << "hundreds of km from the terminal\n"
+                  << "           for most of a pass.\n";
+        // Say what would have covered THIS pass, rather than leaving the reader
+        // to derive it. Ground range from terminal to sub-satellite point at
+        // elevation e on a shell of altitude h:
+        //     psi = acos(Re cos e / (Re + h)) - e,  d = Re psi.
+        if (g_minServElevDeg < 1e8)
+        {
+            const double kRe = 6371e3;
+            const double e = g_minServElevDeg * M_PI / 180.0;
+            const double psi = std::acos(kRe * std::cos(e) / (kRe + g_leoAltM)) - e;
+            const double needM = kRe * psi;
+            std::cout << "           This run's serving elevation reached "
+                      << std::fixed << std::setprecision(1) << g_minServElevDeg
+                      << " deg, where the terminal is "
+                      << std::setprecision(0) << (needM / 1000.0)
+                      << " km from the sub-satellite point.\n"
+                      << "           --d1Threshold=" << std::setprecision(0) << needM
+                      << " would have covered the whole pass.\n";
+        }
+        std::cout << "           Alternatively select a trigger that does not gate on D1.\n";
+    }
     std::ofstream kpiSummary(outputDir + "/kpi_summary.txt");
     kpiSummary << "=== NTN-CHO KPI Summary (REAL plane) ===\n"
                << "Trigger Type: " << algorithm << "\n"
