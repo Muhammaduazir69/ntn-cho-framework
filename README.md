@@ -24,7 +24,7 @@
 
 A LEO satellite is a cell that leaves. Terrestrial handover logic asks which neighbour looks best right now, which in orbit is a question that answers itself wrongly: the best-looking neighbour is often the one about to set. This module estimates **time to exit**, how long a candidate will still be serviceable, from real orbit propagation, and conditions the handover decision on it.
 
-The payoff is measurable and it is not subtle. Over ten seeds on a 780 km shell, a TTE-aware policy reaches 83.14% handover success on 134.6 handovers per run with no ping-pong at all, against an A3 RSRP baseline that spends 463.3 handovers to reach 69.16% with a 50.23% ping-pong rate. A location-based policy scores higher on raw success, 98.69%, and pays 57.07% ping-pong for it.
+This README does not quote performance figures. Earlier versions did, from an archived 780 km scenario that the current campaign supersedes; the numbers that stand are the ones in the accompanying manuscript, regenerated from the campaign scenario `ntn-cho-tte-campaign` and its scripts. Note that, with exact ephemerides, an exit-triggered time-to-exit rule is the classical maximum-service-time rule, and the campaign reports it as such.
 
 The standardized trigger set is implemented rather than approximated: TS 38.331 CondEvent A3, D1 on a fixed reference location, T1 on its absolute broadcast epoch, and Rel-18 D2 on a moving ephemeris reference, plus the elevation and timing-advance mechanisms TR 38.821 studies. A trigger that fires moves a terminal onto a real cell whose SINR is then measured.
 
