@@ -1,0 +1,81 @@
+diff --git a/contrib/ntn-constellation/model/sgp4-mobility-model.cc b/contrib/ntn-constellation/model/sgp4-mobility-model.cc
+index 390cd4cbb..3e380b786 100644
+--- a/contrib/ntn-constellation/model/sgp4-mobility-model.cc
++++ b/contrib/ntn-constellation/model/sgp4-mobility-model.cc
+@@ -306,7 +306,7 @@ Sgp4MobilityModel::EnsureCache() const
+     {
+         return;
+     }
+-    const double unix_s = m_elements.epoch_unix_s + now.GetSeconds();
++    const double unix_s = SimBaseUnix() + now.GetSeconds();
+     Vector pos_eci;
+     Vector vel_eci;
+     Propagate(unix_s, pos_eci, vel_eci);
+@@ -327,7 +327,7 @@ Vector
+ Sgp4MobilityModel::GetEcefPosition() const
+ {
+     EnsureCache();
+-    const double unix_s = m_elements.epoch_unix_s +
++    const double unix_s = SimBaseUnix() +
+                             Simulator::Now().GetSeconds();
+     return EciToEcef(m_cachedEci, unix_s);
+ }
+@@ -336,7 +336,7 @@ void
+ Sgp4MobilityModel::GetEcefStateAt(Time offset, Vector& posEcef, Vector& velEcef) const
+ {
+     const double unix_s =
+-        m_elements.epoch_unix_s + Simulator::Now().GetSeconds() + offset.GetSeconds();
++        SimBaseUnix() + Simulator::Now().GetSeconds() + offset.GetSeconds();
+     Vector posEci;
+     Vector velEci;
+     Propagate(unix_s, posEci, velEci);
+@@ -351,7 +351,7 @@ Vector
+ Sgp4MobilityModel::GetEcefVelocity() const
+ {
+     EnsureCache();
+-    const double unix_s = m_elements.epoch_unix_s +
++    const double unix_s = SimBaseUnix() +
+                             Simulator::Now().GetSeconds();
+     // ECEF velocity = R(ECI->ECEF) * vel_eci - omega x r_ecef
+     Vector v_eci_in_ecef = EciToEcef(m_cachedEciVel, unix_s);
+diff --git a/contrib/ntn-constellation/model/sgp4-mobility-model.h b/contrib/ntn-constellation/model/sgp4-mobility-model.h
+index 2e1d096e6..55398febd 100644
+--- a/contrib/ntn-constellation/model/sgp4-mobility-model.h
++++ b/contrib/ntn-constellation/model/sgp4-mobility-model.h
+@@ -36,6 +36,8 @@
+ #include "ns3/mobility-model.h"
+ #include "ns3/nstime.h"
+ 
++#include <cmath>
++#include <limits>
+ #include <memory>
+ #include <string>
+ 
+@@ -103,6 +105,18 @@ class Sgp4MobilityModel : public GeocentricConstantPositionMobilityModel
+     /// comparing SGP4 against itself.
+     bool IsUsingSgp4() const;
+ 
++    /// R2: anchor simulation time zero at an absolute UTC instant (Unix
++    /// seconds). By default time zero is the element set's own epoch, which
++    /// is what a Walker shell built from one epoch wants. Satellites loaded
++    /// from real element sets each carry their own epoch, so a constellation
++    /// of them is only consistent when every satellite is anchored to the
++    /// same instant.
++    void SetSimulationEpochUnix(double unixS) { m_simEpochUnixS = unixS; m_cacheValid = false; }
++    double SimBaseUnix() const
++    {
++        return std::isnan(m_simEpochUnixS) ? m_elements.epoch_unix_s : m_simEpochUnixS;
++    }
++
+     /// Read-only access to the installed elements.
+     const KeplerianElements& GetElements() const { return m_elements; }
+ 
+@@ -217,6 +231,8 @@ class Sgp4MobilityModel : public GeocentricConstantPositionMobilityModel
+     /// CVC-12: how many times it failed mid-run and silently fell back.
+     mutable uint64_t m_sgp4Fallbacks{0};
+ 
++    double m_simEpochUnixS{std::numeric_limits<double>::quiet_NaN()}; //!< R2: see SetSimulationEpochUnix
++
+     // Cache.
+     mutable bool m_cacheValid{false};
+     mutable Time m_cacheTime;
