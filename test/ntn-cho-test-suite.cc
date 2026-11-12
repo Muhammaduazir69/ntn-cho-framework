@@ -15,6 +15,7 @@
 #include "ns3/ntn-measurement-model.h"
 #include "ns3/ntn-orbit-predictor.h"
 #include "ns3/ntn-rach-window.h"
+#include "ns3/ntn-realistic-mobility.h"
 #include "ns3/ntn-tr38811-mobility-model.h"
 #include "ns3/ntn-tte-estimator.h"
 
@@ -920,6 +921,178 @@ class NtnTteEstimatorComputeTteTestCase : public TestCase
     }
 };
 
+// Shared fixture for the ephemeris and exit-policy tests: a satellite crossing
+// directly over a terminal on the equator, the geometry CHO-8 already
+// validates against spherical truth, with a nadir-fixed 4-degree beam.
+static Ptr<NtnOrbitPredictor>
+MakeCrossingPredictor(double vx, Ptr<ConstantVelocityMobilityModel>& satMob)
+{
+    satMob = CreateObject<ConstantVelocityMobilityModel>();
+    satMob->SetPosition(Vector(6371e3 + 600e3, 0.0, 0.0));
+    satMob->SetVelocity(Vector(0.0, vx, 0.0));
+    auto pred = CreateObject<NtnOrbitPredictor>();
+    pred->SetKinematicsSource(1, satMob);
+    pred->SetGeometricBeam(30.0, 4.0);
+    pred->SetSteeredBeam(false);
+    return pred;
+}
+
+static Ptr<NtnTteEstimator>
+MakeFineEstimator(Ptr<NtnOrbitPredictor> pred)
+{
+    auto est = CreateObject<NtnTteEstimator>();
+    est->SetOrbitPredictor(pred);
+    est->SetAttribute("PredictionStep", TimeValue(MilliSeconds(100)));
+    est->SetAttribute("MaxPredictionWindow", TimeValue(Seconds(120.0)));
+    est->SetAttribute("BinarySearchTolerance", TimeValue(MilliSeconds(10)));
+    return est;
+}
+
+/**
+ * An along-track ephemeris error is a time shift of the pass: a satellite the
+ * network believes is 2 km further along its track leaves the beam 2 km / v
+ * earlier. The shift is predicted from the geometry, not read off the model.
+ */
+class ChoEphemerisErrorShiftsExitTestCase : public TestCase
+{
+  public:
+    ChoEphemerisErrorShiftsExitTestCase()
+        : TestCase("ephemeris error: an along-track offset shifts the predicted exit by offset/v")
+    {
+    }
+
+    void DoRun() override
+    {
+        const double vx = 7560.0;
+        Ptr<ConstantVelocityMobilityModel> satMob;
+        auto pred = MakeCrossingPredictor(vx, satMob);
+        auto est = MakeFineEstimator(pred);
+        const GeoCoordinate ue(0.0, 0.0, 0.0);
+
+        const double t0 = est->ComputeTte(ue, Vector(0, 0, 0), 1, 0, -3.0).tte.GetSeconds();
+        const double alongM = 2000.0;
+        pred->SetEphemerisErrorRtn(1, 0.0, alongM, 0.0);
+        const double t1 = est->ComputeTte(ue, Vector(0, 0, 0), 1, 0, -3.0).tte.GetSeconds();
+
+        // Ahead along the track means out of the beam sooner, by offset / speed.
+        const double expected = -alongM / vx;
+        NS_TEST_ASSERT_MSG_LT(t1, t0, "a satellite believed further along its track exits sooner");
+        NS_TEST_ASSERT_MSG_EQ_TOL(t1 - t0, expected, 0.2 * std::abs(expected),
+                                  "along-track error must shift the exit by offset / speed ("
+                                      << expected << " s); got " << (t1 - t0) << " s");
+
+        // The error lives in the prediction only. The mobility model the
+        // scenario owns, which stands for the true orbit, is untouched.
+        NS_TEST_ASSERT_MSG_EQ_TOL(satMob->GetPosition().y, 0.0, 1e-9,
+                                  "injecting an ephemeris error must not move the true satellite");
+
+        pred->ClearEphemerisErrors();
+        const double t2 = est->ComputeTte(ue, Vector(0, 0, 0), 1, 0, -3.0).tte.GetSeconds();
+        NS_TEST_ASSERT_MSG_EQ_TOL(t2, t0, 0.02, "clearing the error restores the exact prediction");
+        Simulator::Destroy();
+    }
+};
+
+/**
+ * First-order error propagation: along-track sigma maps to sigma / v at any
+ * geometry, while a cross-track offset barely moves the exit of a pass over the
+ * ground track (its first-order sensitivity is proportional to the terminal's
+ * cross-track distance, which is zero here). The call must also leave any
+ * injected error exactly as it found it.
+ */
+class ChoTteSigmaPropagationTestCase : public TestCase
+{
+  public:
+    ChoTteSigmaPropagationTestCase()
+        : TestCase("ComputeTteSigma: along-track sigma maps to sigma/v; cross-track vanishes overhead")
+    {
+    }
+
+    void DoRun() override
+    {
+        const double vx = 7560.0;
+        Ptr<ConstantVelocityMobilityModel> satMob;
+        auto pred = MakeCrossingPredictor(vx, satMob);
+        auto est = MakeFineEstimator(pred);
+        const GeoCoordinate ue(0.0, 0.0, 0.0);
+        pred->SetEphemerisErrorRtn(1, 10.0, 20.0, 30.0);
+
+        const double sAlong = est->ComputeTteSigma(ue, Vector(0, 0, 0), 1, 0, -3.0, 0.0, 2000.0, 0.0);
+        NS_TEST_ASSERT_MSG_EQ_TOL(sAlong, 2000.0 / vx, 0.2 * 2000.0 / vx,
+                                  "along-track sigma must propagate as sigma / v");
+        const double sCross = est->ComputeTteSigma(ue, Vector(0, 0, 0), 1, 0, -3.0, 0.0, 0.0, 2000.0);
+        NS_TEST_ASSERT_MSG_LT(sCross, 0.2 * sAlong,
+                              "a pass over the ground track is insensitive to cross-track error "
+                              "at first order");
+        const Vector after = pred->GetEphemerisErrorRtn(1);
+        NS_TEST_ASSERT_MSG_EQ_TOL(after.x, 10.0, 1e-12, "radial error restored");
+        NS_TEST_ASSERT_MSG_EQ_TOL(after.y, 20.0, 1e-12, "along-track error restored");
+        NS_TEST_ASSERT_MSG_EQ_TOL(after.z, 30.0, 1e-12, "cross-track error restored");
+        NS_TEST_ASSERT_MSG_EQ_TOL(est->ComputeTteSigma(ue, Vector(0, 0, 0), 1, 0, -3.0, 0, 0, 0),
+                                  0.0, 1e-12, "no uncertainty, no sigma");
+        Simulator::Destroy();
+    }
+};
+
+/**
+ * Exit-triggered selection: while the serving cell has more life than the
+ * margin the rule stays put, even though a longer-lived candidate exists (the
+ * eager rule would switch); once the serving cell is inside the margin it takes
+ * the LONGEST-lived candidate, not the strongest one.
+ */
+class ChoExitTriggeredSelectionTestCase : public TestCase
+{
+  public:
+    ChoExitTriggeredSelectionTestCase()
+        : TestCase("tteExitTriggered: stay until the serving exit, then take the longest-lived cell")
+    {
+    }
+
+    uint16_t Select(Time margin, bool exitTriggered)
+    {
+        Ptr<ConstantVelocityMobilityModel> satMob;
+        auto pred = MakeCrossingPredictor(7560.0, satMob); // serving: exits in about 3 s
+        auto est = MakeFineEstimator(pred);
+        auto cho = CreateObject<NtnChoAlgorithm>();
+        cho->SetOrbitPredictor(pred);
+        cho->SetTteEstimator(est);
+        auto cfg = cho->GetConfig();
+        cfg.triggerType = NtnChoAlgorithm::TRIGGER_TTE_AWARE;
+        cfg.tteRequireD1 = false;
+        cfg.tteExitTriggered = exitTriggered;
+        cfg.tteExitMargin = margin;
+        cfg.tteMinimum = Seconds(10.0);
+        cfg.maxCandidates = 6;
+        cho->Configure(cfg);
+        cho->UpdateUeKinematics(GeoCoordinate(0.0, 0.0, 0.0), Vector(0, 0, 0));
+        cho->AddCandidateCell(1, 1, 0);
+        cho->UpdateCandidateSlantRange(1, 600e3);
+        cho->UpdateMeasurement(1, 10.0, 0.0);
+        cho->SetServingCell(1);
+        cho->AddCandidateCell(2, 2, 0);
+        cho->AddCandidateCell(3, 3, 0);
+        cho->UpdateMeasurement(2, 5.0, 0.0);  // weaker, lives longer
+        cho->UpdateMeasurement(3, 15.0, 0.0); // stronger, sets sooner
+        cho->SetCandidateStateForTest(2, Seconds(50.0), true, true);
+        cho->SetCandidateStateForTest(3, Seconds(30.0), true, true);
+        const uint16_t pick = cho->SelectBestCandidate();
+        Simulator::Destroy();
+        return pick;
+    }
+
+    void DoRun() override
+    {
+        NS_TEST_ASSERT_MSG_EQ(Select(Seconds(5.0), true), 2,
+                              "inside the margin the rule must take the longest-lived candidate "
+                              "(cell 2, 50 s) rather than the strongest (cell 3, 15 dB)");
+        NS_TEST_ASSERT_MSG_EQ(Select(Seconds(1.0), true), NtnChoAlgorithm::INVALID_CELL_ID,
+                              "with the serving cell still outside the margin the rule must stay");
+        NS_TEST_ASSERT_MSG_NE(Select(Seconds(1.0), false), NtnChoAlgorithm::INVALID_CELL_ID,
+                              "the eager rule switches in the same state, which is the difference "
+                              "the exit trigger exists to make");
+    }
+};
+
 class NtnGeodeticFixedMobilityTestCase : public TestCase
 {
   public:
@@ -1102,6 +1275,77 @@ class NtnChoStandardizedTriggersTestCase : public TestCase
 /// successful handover onward that lookup missed and every one of those triggers
 /// returned early. They were dead for the rest of the run while still being
 /// reported as the active trigger.
+/**
+ * CHO-20. Two handovers must not empty the candidate map.
+ *
+ * NotifyHandoverComplete drops the cell just moved TO, which is right: it is the
+ * serving cell now, not a candidate. GAP H3 kept "the rest" armed, but with a
+ * small candidate set there is no rest. Handover to B erases B, handover to C
+ * erases C, and the cell the terminal came FROM was never put back, so from the
+ * second execution the map holds only the original serving cell and eventually
+ * nothing. Every trigger then evaluates an empty set and SelectBestCandidate
+ * returns INVALID_CELL_ID for the remainder of the run, at any geometry.
+ *
+ * The vacated cell is a legitimate neighbour the moment the handover completes,
+ * and Rel-17 keeps prepared candidates across an execution, so it is re-armed.
+ */
+class ChoVacatedCellIsRearmedTestCase : public TestCase
+{
+  public:
+    ChoVacatedCellIsRearmedTestCase()
+        : TestCase("CHO-20 - the cell a terminal leaves is re-armed as a candidate")
+    {
+    }
+
+  private:
+    void DoRun() override
+    {
+        auto cho = CreateObject<NtnChoAlgorithm>();
+        NtnChoAlgorithm::ChoConfig cfg = cho->GetConfig();
+        cfg.triggerType = NtnChoAlgorithm::TRIGGER_ELEVATION;
+        cho->Configure(cfg);
+
+        const uint16_t cellA = 1;
+        const uint16_t cellB = 2;
+        const uint16_t cellC = 3;
+        cho->AddCandidateCell(cellA, 0, 0);
+        cho->AddCandidateCell(cellB, 1, 0);
+        cho->AddCandidateCell(cellC, 2, 0);
+        cho->SetServingCell(cellA);
+        cho->UpdateCandidateSlantRange(cellA, 1200e3);
+        cho->UpdateMeasurement(cellA, 12.0, 25.0);
+
+        // First handover, A -> B. B is erased as the new serving cell. A is
+        // still in the map because it was registered at setup, so nothing is
+        // lost yet and this step passes with or without the fix.
+        cho->NotifyHandoverComplete(cellB, true);
+        cho->SetServingCell(cellB);
+        cho->UpdateCandidateSlantRange(cellB, 1300e3);
+        cho->UpdateMeasurement(cellB, 11.0, 24.0);
+
+        // Second handover, B -> C. C is erased. B is the cell just vacated, and
+        // it is NOT in the map any more: it was removed by the first handover.
+        // Without the re-arm the map now holds only A, and one more handover
+        // empties it completely.
+        cho->NotifyHandoverComplete(cellC, true);
+        cho->SetServingCell(cellC);
+
+        // A cell absent from the map cannot have its state set, so this is a
+        // presence check that does not need a new accessor.
+        cho->SetCandidateStateForTest(cellB, Seconds(30), /*admitted=*/true, /*d1Met=*/true);
+        NS_TEST_ASSERT_MSG_EQ(cho->IsCandidateAdmitted(cellB), true,
+                              "the cell the terminal just left must be re-armed as a "
+                              "candidate; without this the map drains to empty after two "
+                              "handovers and every trigger goes permanently silent");
+
+        // And the original serving cell must not have been evicted by the fix.
+        cho->SetCandidateStateForTest(cellA, Seconds(30), /*admitted=*/true, /*d1Met=*/true);
+        NS_TEST_ASSERT_MSG_EQ(cho->IsCandidateAdmitted(cellA), true,
+                              "re-arming the vacated cell must not displace candidates that "
+                              "were already in the map");
+    }
+};
+
 class NtnChoTriggersSurviveHandoverTestCase : public TestCase
 {
   public:
@@ -1970,6 +2214,516 @@ class ChoNtnNtnCandidateReferenceTestCase : public TestCase
     }
 };
 
+
+// ---------------------------------------------------------------------------
+// Phase-1 (Oct 2026) regression tests: each was confirmed to FAIL with its fix
+// reverted (papers/paper2_taes_tte_cho/research/module_deep/FIX_LOG.md).
+// ---------------------------------------------------------------------------
+
+/// Builds an exit-triggered TTE-CHO algorithm on the crossing fixture, serving
+/// cell 1 (satellite 1), with candidates 2 and 3 registered.
+static Ptr<NtnChoAlgorithm>
+MakeExitTriggeredCho(Ptr<NtnOrbitPredictor>& pred, Ptr<NtnTteEstimator>& est,
+                     Ptr<ConstantVelocityMobilityModel>& satMob)
+{
+    pred = MakeCrossingPredictor(7560.0, satMob);
+    est = MakeFineEstimator(pred);
+    auto cho = CreateObject<NtnChoAlgorithm>();
+    cho->SetOrbitPredictor(pred);
+    cho->SetTteEstimator(est);
+    auto cfg = cho->GetConfig();
+    cfg.triggerType = NtnChoAlgorithm::TRIGGER_TTE_AWARE;
+    cfg.tteRequireD1 = false;
+    cfg.tteExitTriggered = true;
+    cfg.tteExitMargin = MilliSeconds(200);
+    cfg.tteMinimum = Seconds(10.0);
+    cfg.qualityThreshold_dB = -3.0;
+    cfg.tteServingFloor_dB = -6.0;
+    cfg.tteServingFloorTtt = Seconds(0);
+    cfg.maxCandidates = 6;
+    cho->Configure(cfg);
+    cho->UpdateUeKinematics(GeoCoordinate(0.0, 0.0, 0.0), Vector(0, 0, 0));
+    cho->AddCandidateCell(1, 1, 0);
+    cho->UpdateCandidateSlantRange(1, 600e3);
+    cho->UpdateMeasurement(1, 10.0, 0.0);
+    cho->SetServingCell(1);
+    cho->AddCandidateCell(2, 2, 0);
+    cho->AddCandidateCell(3, 3, 0);
+    return cho;
+}
+
+/**
+ * F2: when the serving link is lost (filtered quality below the floor for the
+ * time-to-trigger) the rule must leave even if no candidate has tau_min of
+ * predicted coverage left. Before the fix the empty admissible set returned
+ * "stay" before the safety net was ever checked, and the terminal sat on a dead
+ * link until T310 expired.
+ */
+class ChoSafetyNetWithoutAdmissibleTestCase : public TestCase
+{
+  public:
+    ChoSafetyNetWithoutAdmissibleTestCase()
+        : TestCase("F2: the safety net fires even when no candidate meets tau_min")
+    {
+    }
+
+    void DoRun() override
+    {
+        Ptr<NtnOrbitPredictor> pred;
+        Ptr<NtnTteEstimator> est;
+        Ptr<ConstantVelocityMobilityModel> satMob;
+        auto cho = MakeExitTriggeredCho(pred, est, satMob);
+        cho->UpdateMeasurement(1, -12.0, 0.0); // serving link collapsed
+        cho->UpdateMeasurement(2, 0.0, 0.0);
+        cho->UpdateMeasurement(3, 2.0, 0.0);
+        // both candidates pass the quality floor but have under 10 s left
+        cho->SetCandidateStateForTest(2, Seconds(6.0), /*admitted=*/false, /*d1Met=*/true);
+        cho->SetCandidateStateForTest(3, Seconds(4.0), /*admitted=*/false, /*d1Met=*/true);
+        const uint16_t pick = cho->SelectBestCandidate();
+        NS_TEST_ASSERT_MSG_EQ(pick, 2,
+                              "with the serving link lost the rule must escape to the candidate "
+                              "with the longest predicted exit (cell 2) even below tau_min");
+        NS_TEST_ASSERT_MSG_EQ(cho->LastSelectionViaSafetyNet(), true,
+                              "the selection must be recorded as a safety-net escape");
+        // a candidate below the quality floor is never an escape target
+        cho->UpdateMeasurement(2, -5.0, 0.0);
+        cho->UpdateMeasurement(3, -5.0, 0.0);
+        NS_TEST_ASSERT_MSG_EQ(cho->SelectBestCandidate(), NtnChoAlgorithm::INVALID_CELL_ID,
+                              "candidates below Q are not escape targets");
+        Simulator::Destroy();
+    }
+};
+
+/**
+ * F23: an escape must not require time left inside the quality-feasible
+ * contour. With e_Q above a strong candidate's elevation its predicted time to
+ * exit e_Q is 0; before the fix the escape pool required tau > 0, found nothing
+ * and the terminal stayed on its blocked link until radio link failure.
+ */
+class ChoEscapeBelowExitContourTestCase : public TestCase
+{
+  public:
+    ChoEscapeBelowExitContourTestCase()
+        : TestCase("F23: the safety net escapes to a strong candidate below the exit contour")
+    {
+    }
+
+    void DoRun() override
+    {
+        Ptr<NtnOrbitPredictor> pred;
+        Ptr<NtnTteEstimator> est;
+        Ptr<ConstantVelocityMobilityModel> satMob;
+        auto cho = MakeExitTriggeredCho(pred, est, satMob);
+        cho->UpdateMeasurement(1, -12.0, 0.0); // serving link blocked
+        cho->UpdateMeasurement(2, 6.0, 0.0);   // strong, but below e_Q
+        cho->UpdateMeasurement(3, 0.0, 0.0);   // weaker, also below e_Q
+        cho->SetCandidateStateForTest(2, Seconds(0.0), /*admitted=*/false, /*d1Met=*/true);
+        cho->SetCandidateStateForTest(3, Seconds(0.0), /*admitted=*/false, /*d1Met=*/true);
+        const uint16_t pick = cho->SelectBestCandidate();
+        NS_TEST_ASSERT_MSG_EQ(pick, 2,
+                              "with the serving link lost the rule must escape to the strongest "
+                              "candidate above Q even when no candidate has time left inside e_Q");
+        NS_TEST_ASSERT_MSG_EQ(cho->LastSelectionViaSafetyNet(), true,
+                              "the selection must be recorded as a safety-net escape");
+        Simulator::Destroy();
+    }
+};
+
+/**
+ * N1: with rankByUsableTime the target is the candidate with the largest
+ * expected usable time, which can differ from the one with the latest exit.
+ */
+class ChoRankByUsableTimeTestCase : public TestCase
+{
+  public:
+    ChoRankByUsableTimeTestCase()
+        : TestCase("N1: rankByUsableTime picks the largest expected usable time, not the latest exit")
+    {
+    }
+
+    uint16_t Pick(bool byUsable)
+    {
+        Ptr<NtnOrbitPredictor> pred;
+        Ptr<NtnTteEstimator> est;
+        Ptr<ConstantVelocityMobilityModel> satMob;
+        auto cho = MakeExitTriggeredCho(pred, est, satMob);
+        auto cfg = cho->GetConfig();
+        cfg.rankByUsableTime = byUsable;
+        cfg.tteExitMargin = Seconds(5.0); // serving (about 3 s left) is inside it
+        cho->Configure(cfg);
+        cho->UpdateMeasurement(2, 5.0, 0.0);
+        cho->UpdateMeasurement(3, 5.0, 0.0);
+        // cell 2 sets later but spends its pass low (often blocked);
+        // cell 3 sets sooner but stays high
+        cho->SetCandidateStateForTest(2, Seconds(60.0), true, true);
+        cho->SetCandidateStateForTest(3, Seconds(50.0), true, true);
+        cho->SeedCandidatePrediction(2, Seconds(60.0), Seconds(40.0));
+        cho->SeedCandidatePrediction(3, Seconds(50.0), Seconds(48.0));
+        const uint16_t pick = cho->SelectBestCandidate();
+        Simulator::Destroy();
+        return pick;
+    }
+
+    void DoRun() override
+    {
+        NS_TEST_ASSERT_MSG_EQ(Pick(false), 2, "ranked by exit time, the later exit (cell 2) wins");
+        NS_TEST_ASSERT_MSG_EQ(Pick(true), 3,
+                              "ranked by expected usable time, cell 3 (48 s) beats cell 2 (40 s)");
+    }
+};
+
+/**
+ * N1: the usable time is the LOS-probability integral of the predicted pass.
+ * Without a table, or with P_LOS = 100 % everywhere, it equals the time to
+ * exit; with a uniform 50 % table it is half of it.
+ */
+class TteUsableTimeIntegralTestCase : public TestCase
+{
+  public:
+    TteUsableTimeIntegralTestCase()
+        : TestCase("N1: usable time = integral of P_LOS over the predicted pass")
+    {
+    }
+
+    void DoRun() override
+    {
+        Ptr<ConstantVelocityMobilityModel> satMob;
+        auto pred = MakeCrossingPredictor(7560.0, satMob);
+        auto est = MakeFineEstimator(pred);
+        const GeoCoordinate ue(0.0, 0.0, 0.0);
+        const auto r0 = est->ComputeTte(ue, Vector(0, 0, 0), 1, 0, -3.0);
+        NS_TEST_ASSERT_MSG_GT(r0.tte.GetSeconds(), 0.5, "fixture: the satellite covers the terminal");
+        NS_TEST_ASSERT_MSG_EQ_TOL(r0.usable.GetSeconds(), r0.tte.GetSeconds(),
+                                  1e-6 * r0.tte.GetSeconds(),
+                                  "no LOS table: usable time equals the time to exit");
+        std::map<int, double> full;
+        std::map<int, double> half;
+        for (int b = 10; b <= 90; b += 10)
+        {
+            full[b] = 100.0;
+            half[b] = 50.0;
+        }
+        est->SetLosProbabilityTable(full);
+        const auto r1 = est->ComputeTte(ue, Vector(0, 0, 0), 1, 0, -3.0);
+        NS_TEST_ASSERT_MSG_EQ_TOL(r1.usable.GetSeconds(), r1.tte.GetSeconds(),
+                                  1e-6 * r1.tte.GetSeconds(),
+                                  "P_LOS = 100 % everywhere: usable time equals the time to exit");
+        est->SetLosProbabilityTable(half);
+        const auto r2 = est->ComputeTte(ue, Vector(0, 0, 0), 1, 0, -3.0);
+        NS_TEST_ASSERT_MSG_EQ_TOL(r2.usable.GetSeconds(), 0.5 * r2.tte.GetSeconds(),
+                                  0.02 * r2.tte.GetSeconds(),
+                                  "P_LOS = 50 % everywhere: usable time is half the time to exit");
+        NS_TEST_ASSERT_MSG_EQ_TOL(r2.tte.GetSeconds(), r0.tte.GetSeconds(), 1e-9,
+                                  "the LOS table must not change the time to exit itself");
+        Simulator::Destroy();
+    }
+};
+
+/**
+ * N3: after a safety-net escape from cell 1, cell 1 is not an escape target
+ * for escapeHoldoff unless it is the only one.
+ */
+class ChoEscapeHoldoffTestCase : public TestCase
+{
+  public:
+    ChoEscapeHoldoffTestCase()
+        : TestCase("N3: the cell left through the safety net is held off as a target")
+    {
+    }
+
+    uint16_t SecondEscape(Time holdoff, bool onlyOne)
+    {
+        Ptr<NtnOrbitPredictor> pred;
+        Ptr<NtnTteEstimator> est;
+        Ptr<ConstantVelocityMobilityModel> satMob;
+        auto cho = MakeExitTriggeredCho(pred, est, satMob);
+        auto cfg = cho->GetConfig();
+        cfg.escapeHoldoff = holdoff;
+        cho->Configure(cfg);
+        cho->SetHandoverExecutionCallback(MakeCallback(+[](uint16_t, uint16_t) {}));
+        cho->UpdateMeasurement(1, -12.0, 0.0);
+        cho->UpdateMeasurement(2, 3.0, 0.0);
+        cho->SetCandidateStateForTest(2, Seconds(40.0), true, true);
+        cho->SetCandidateStateForTest(3, Seconds(30.0), true, true);
+        cho->UpdateMeasurement(3, -9.0, 0.0); // cell 3 below Q at the first escape
+        const uint16_t first = cho->SelectBestCandidate();
+        NS_TEST_EXPECT_MSG_EQ(first, 2, "fixture: the first escape goes to cell 2");
+        cho->ExecuteHandover(first);
+        cho->NotifyHandoverComplete(first, true);
+        cho->SetServingCell(2);
+        // cell 1 recovers and would now be the best escape target
+        cho->AddCandidateCell(1, 1, 0);
+        cho->UpdateMeasurement(1, 5.0, 0.0);
+        cho->SetCandidateStateForTest(1, Seconds(80.0), true, true);
+        cho->UpdateMeasurement(3, onlyOne ? -9.0 : 4.0, 0.0);
+        cho->SetCandidateStateForTest(3, Seconds(30.0), true, true);
+        cho->UpdateMeasurement(2, -12.0, 0.0); // the new serving link collapses too
+        const uint16_t second = cho->SelectBestCandidate();
+        Simulator::Destroy();
+        return second;
+    }
+
+    void DoRun() override
+    {
+        NS_TEST_ASSERT_MSG_EQ(SecondEscape(Seconds(0), false), 1,
+                              "without hold-off the terminal returns to the cell it escaped from");
+        NS_TEST_ASSERT_MSG_EQ(SecondEscape(Seconds(5), false), 3,
+                              "with hold-off the escaped cell is skipped while another exists");
+        NS_TEST_ASSERT_MSG_EQ(SecondEscape(Seconds(5), true), 1,
+                              "the escaped cell is still taken when it is the only target");
+    }
+};
+
+/**
+ * F3b: with tteCacheRefresh = 1 s a candidate's exit is aged between full
+ * recomputations rather than recomputed at every evaluation.
+ */
+class ChoPredictionCacheTestCase : public TestCase
+{
+  public:
+    ChoPredictionCacheTestCase()
+        : TestCase("F3b: candidate predictions are cached and aged between refreshes")
+    {
+    }
+
+    Ptr<NtnChoAlgorithm> m_cho;
+    std::vector<uint64_t> m_counts;
+    std::vector<double> m_ttes;
+
+    void Probe()
+    {
+        m_cho->UpdateMeasurement(2, 5.0, 0.0);
+        m_cho->EvaluateConditions();
+        m_counts.push_back(m_cho->GetTteEvaluationCount());
+        m_ttes.push_back(m_cho->GetCandidateTte(2).GetSeconds());
+    }
+
+    void DoRun() override
+    {
+        Ptr<ConstantVelocityMobilityModel> satMob;
+        auto pred = MakeCrossingPredictor(7560.0, satMob);
+        // candidate 2 is a satellite on the same track, 10 s behind
+        auto mob2 = CreateObject<ConstantVelocityMobilityModel>();
+        mob2->SetPosition(Vector(6371e3 + 600e3, -7560.0 * 2.0, 0.0));
+        mob2->SetVelocity(Vector(0.0, 7560.0, 0.0));
+        pred->SetKinematicsSource(2, mob2);
+        auto est = MakeFineEstimator(pred);
+        m_cho = CreateObject<NtnChoAlgorithm>();
+        m_cho->SetOrbitPredictor(pred);
+        m_cho->SetTteEstimator(est);
+        auto cfg = m_cho->GetConfig();
+        cfg.triggerType = NtnChoAlgorithm::TRIGGER_TTE_AWARE;
+        cfg.tteRequireD1 = false;
+        cfg.tteCacheRefresh = Seconds(1.0);
+        cfg.qualityThreshold_dB = -3.0;
+        m_cho->Configure(cfg);
+        m_cho->UpdateUeKinematics(GeoCoordinate(0.0, 0.0, 0.0), Vector(0, 0, 0));
+        m_cho->AddCandidateCell(1, 1, 0);
+        m_cho->UpdateMeasurement(1, 10.0, 0.0);
+        m_cho->SetServingCell(1);
+        m_cho->AddCandidateCell(2, 2, 0);
+        Simulator::Schedule(Seconds(0.0), &ChoPredictionCacheTestCase::Probe, this);
+        Simulator::Schedule(Seconds(0.5), &ChoPredictionCacheTestCase::Probe, this);
+        Simulator::Schedule(Seconds(1.0), &ChoPredictionCacheTestCase::Probe, this);
+        Simulator::Run();
+        NS_TEST_ASSERT_MSG_EQ(m_counts.size(), 3u, "three probes");
+        NS_TEST_ASSERT_MSG_EQ(m_counts[1], m_counts[0],
+                              "inside the refresh interval the exit is aged, not recomputed");
+        NS_TEST_ASSERT_MSG_EQ_TOL(m_ttes[0] - m_ttes[1], 0.5, 1e-6,
+                                  "the cached exit ages by the elapsed time");
+        NS_TEST_ASSERT_MSG_EQ(m_counts[2], m_counts[0] + 1,
+                              "at the refresh interval the exit is recomputed once");
+        NS_TEST_ASSERT_MSG_EQ_TOL(m_ttes[2], m_ttes[0] - 1.0, 0.05,
+                                  "the recomputed exit agrees with the aged one");
+        Simulator::Destroy();
+    }
+};
+
+/**
+ * F7: the elevation trigger uses the elevation the scenario feeds, not the
+ * spherical slant-range relation.
+ */
+class ChoElevationTriggerUsesFedElevationTestCase : public TestCase
+{
+  public:
+    ChoElevationTriggerUsesFedElevationTestCase()
+        : TestCase("F7: the elevation trigger reads the fed topocentric elevation")
+    {
+    }
+
+    void DoRun() override
+    {
+        Ptr<ConstantVelocityMobilityModel> satMob;
+        auto pred = MakeCrossingPredictor(7560.0, satMob);
+        auto est = MakeFineEstimator(pred);
+        auto cho = CreateObject<NtnChoAlgorithm>();
+        cho->SetOrbitPredictor(pred);
+        cho->SetTteEstimator(est);
+        auto cfg = cho->GetConfig();
+        cfg.triggerType = NtnChoAlgorithm::TRIGGER_ELEVATION;
+        cfg.elevationMinDeg = 30.0;
+        cfg.elevationHystDeg = 2.0;
+        cfg.orbitAltitudeKm = 550.0;
+        cfg.qualityThreshold_dB = -3.0;
+        cho->Configure(cfg);
+        // a slant range that the spherical relation reads as 31.5 deg
+        const double slant31 = 960.0e3;
+        cho->AddCandidateCell(1, 1, 0);
+        cho->UpdateCandidateSlantRange(1, slant31);
+        cho->UpdateMeasurement(1, 10.0, 0.0);
+        cho->SetServingCell(1);
+        cho->AddCandidateCell(2, 2, 0);
+        cho->UpdateCandidateSlantRange(2, 700e3);
+        cho->UpdateMeasurement(2, 10.0, 0.0);
+        cho->UpdateCandidateElevation(2, 50.0);
+        cho->UpdateCandidateElevation(1, 29.0); // truly below the floor
+        cho->EvaluateConditions();
+        NS_TEST_ASSERT_MSG_EQ(cho->SelectBestCandidate(), 2,
+                              "the serving cell is at 29 deg (fed), below the 30 deg floor, so the "
+                              "trigger must fire although the slant relation says 31.5 deg");
+        Simulator::Destroy();
+    }
+};
+
+/**
+ * F13: with the elevation-indexed steered beam, the gain threshold derived for
+ * e_min cuts coverage at a TRUE elevation of e_min at every latitude and
+ * azimuth, for a satellite on a 6928 km shell.
+ */
+class SteeredBeamCoverageEdgeTestCase : public TestCase
+{
+  public:
+    SteeredBeamCoverageEdgeTestCase()
+        : TestCase("F13: the steered-beam coverage edge sits at e_min of true elevation")
+    {
+    }
+
+    // satellite on a sphere of radius rs seen from ue at (geodetic) elev/az
+    static Vector SatAt(const Vector& ue, double latDeg, double lonDeg, double elDeg, double azDeg,
+                        double rs)
+    {
+        const double lat = latDeg * M_PI / 180.0;
+        const double lon = lonDeg * M_PI / 180.0;
+        const Vector up(std::cos(lat) * std::cos(lon), std::cos(lat) * std::sin(lon), std::sin(lat));
+        const Vector east(-std::sin(lon), std::cos(lon), 0.0);
+        const Vector north(-std::sin(lat) * std::cos(lon), -std::sin(lat) * std::sin(lon),
+                           std::cos(lat));
+        const double el = elDeg * M_PI / 180.0;
+        const double az = azDeg * M_PI / 180.0;
+        const Vector d(std::cos(el) * std::sin(az) * east.x + std::cos(el) * std::cos(az) * north.x +
+                           std::sin(el) * up.x,
+                       std::cos(el) * std::sin(az) * east.y + std::cos(el) * std::cos(az) * north.y +
+                           std::sin(el) * up.y,
+                       std::cos(el) * std::sin(az) * east.z + std::cos(el) * std::cos(az) * north.z +
+                           std::sin(el) * up.z);
+        // solve |ue + r d| = rs for r > 0
+        const double b = 2.0 * (ue.x * d.x + ue.y * d.y + ue.z * d.z);
+        const double c = ue.x * ue.x + ue.y * ue.y + ue.z * ue.z - rs * rs;
+        const double r = 0.5 * (-b + std::sqrt(b * b - 4.0 * c));
+        return Vector(ue.x + r * d.x, ue.y + r * d.y, ue.z + r * d.z);
+    }
+
+    void DoRun() override
+    {
+        auto pred = CreateObject<NtnOrbitPredictor>();
+        pred->SetGeometricBeam(30.0, 4.4127);
+        pred->SetSteeredBeam(true, 1.2);
+        pred->SetSteeredBeamElevationIndexed(true, 550e3);
+        const double th = pred->GainThresholdForMinElevationDb(25.0, 550e3);
+        const double rs = 6378137.0 + 550e3;
+        double worst = 0.0;
+        for (double lat : {0.0, 30.0, 50.0})
+        {
+            const Vector ue = ntngeo::GeodeticToEcef(lat, 70.0, 0.0);
+            for (double az : {0.0, 90.0, 180.0, 270.0})
+            {
+                double lo = 10.0;
+                double hi = 40.0;
+                for (int k = 0; k < 40; ++k)
+                {
+                    const double m = 0.5 * (lo + hi);
+                    const Vector s = SatAt(ue, lat, 70.0, m, az, rs);
+                    const double g = pred->ComputeBeamGainAt(1, 0, GeoCoordinate(ue), GeoCoordinate(s));
+                    (g >= th ? hi : lo) = m;
+                }
+                worst = std::max(worst, std::abs(0.5 * (lo + hi) - 25.0));
+            }
+        }
+        NS_TEST_ASSERT_MSG_LT(worst, 0.05,
+                              "the coverage edge must sit within 0.05 deg of e_min = 25 deg of true "
+                              "elevation; worst deviation " << worst << " deg");
+        Simulator::Destroy();
+    }
+};
+
+/**
+ * F14: the layer-3 filter coefficient keeps the TS 38.331 time constant at the
+ * 100 ms measurement period.
+ */
+class L3FilterRateAdaptationTestCase : public TestCase
+{
+  public:
+    L3FilterRateAdaptationTestCase()
+        : TestCase("F14: L3 filter coefficient adapted to the measurement period")
+    {
+    }
+
+    void DoRun() override
+    {
+        NS_TEST_ASSERT_MSG_EQ_TOL(NtnL3FilterCoefficient(4, 0.2), 0.5, 1e-12,
+                                  "k = 4 at the 200 ms reference period is a = 1/2");
+        const double a = NtnL3FilterCoefficient(4, 0.1);
+        NS_TEST_ASSERT_MSG_EQ_TOL(a, 1.0 - std::sqrt(0.5), 1e-12,
+                                  "at 100 ms the same time constant needs a = 1 - sqrt(1/2)");
+        // two 100 ms steps decay a step input exactly as one 200 ms step
+        NS_TEST_ASSERT_MSG_EQ_TOL((1.0 - a) * (1.0 - a), 0.5, 1e-12,
+                                  "two adapted steps equal one reference step");
+    }
+};
+
+/**
+ * F21: a vehicular terminal keeps its own road direction. The Gauss-Markov
+ * heading used to revert to 0 rad, so every vehicle turned north.
+ */
+class VehicularHeadingKeepsRoadDirectionTestCase : public TestCase
+{
+  public:
+    VehicularHeadingKeepsRoadDirectionTestCase()
+        : TestCase("F21: vehicular headings revert to their own mean, not to north")
+    {
+    }
+
+    void DoRun() override
+    {
+        NtnRealisticMobilityHelper h(7);
+        MobilityProfile veh{0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0};
+        auto ues = h.GenerateUes(200, veh, 29.0, 31.0, 69.0, 71.0);
+        std::vector<double> start;
+        for (const auto& u : ues)
+        {
+            start.push_back(u.heading_rad);
+        }
+        for (int k = 0; k < 600; ++k)
+        {
+            for (auto& u : ues)
+            {
+                h.AdvanceUe(u, 1.0);
+            }
+        }
+        double sumAbsDev = 0.0;
+        double sumCosNorth = 0.0;
+        for (size_t i = 0; i < ues.size(); ++i)
+        {
+            sumAbsDev += std::abs(std::remainder(ues[i].heading_rad - start[i], 2.0 * M_PI));
+            sumCosNorth += std::cos(ues[i].heading_rad);
+        }
+        NS_TEST_ASSERT_MSG_LT(sumAbsDev / ues.size(), 0.5,
+                              "after 600 s a vehicle's heading stays near its own road direction");
+        NS_TEST_ASSERT_MSG_LT(std::abs(sumCosNorth / ues.size()), 0.3,
+                              "headings stay spread over all directions, not aligned to north");
+    }
+};
+
 class NtnChoTestSuite : public TestSuite
 {
   public:
@@ -1989,6 +2743,7 @@ class NtnChoTestSuite : public TestSuite
         AddTestCase(new NtnOrbitPredictorTimeOffsetGainTestCase, TestCase::Duration::QUICK);
         AddTestCase(new NtnOrbitPredictorPropagationAccuracyTestCase, TestCase::Duration::QUICK);
         AddTestCase(new NtnChoTriggersSurviveHandoverTestCase, TestCase::Duration::QUICK);
+        AddTestCase(new ChoVacatedCellIsRearmedTestCase, TestCase::Duration::QUICK);
         AddTestCase(new NtnChoRachLessDrivesTimingAdvanceTestCase, TestCase::Duration::QUICK);
         AddTestCase(new ChoExecutionCountEqualsActuationTestCase, TestCase::Duration::QUICK);
         AddTestCase(new ChoHandoverCsvIsWellFormedTestCase, TestCase::Duration::QUICK);
@@ -1998,6 +2753,19 @@ class NtnChoTestSuite : public TestSuite
                     TestCase::Duration::QUICK);
         AddTestCase(new ChoLtmL1CadenceTestCase, TestCase::Duration::QUICK);
         AddTestCase(new ChoNtnNtnCandidateReferenceTestCase, TestCase::Duration::QUICK);
+        AddTestCase(new ChoEphemerisErrorShiftsExitTestCase, TestCase::Duration::QUICK);
+        AddTestCase(new ChoTteSigmaPropagationTestCase, TestCase::Duration::QUICK);
+        AddTestCase(new ChoSafetyNetWithoutAdmissibleTestCase, TestCase::Duration::QUICK);
+        AddTestCase(new ChoEscapeBelowExitContourTestCase, TestCase::Duration::QUICK);
+        AddTestCase(new ChoRankByUsableTimeTestCase, TestCase::Duration::QUICK);
+        AddTestCase(new TteUsableTimeIntegralTestCase, TestCase::Duration::QUICK);
+        AddTestCase(new ChoEscapeHoldoffTestCase, TestCase::Duration::QUICK);
+        AddTestCase(new ChoPredictionCacheTestCase, TestCase::Duration::QUICK);
+        AddTestCase(new ChoElevationTriggerUsesFedElevationTestCase, TestCase::Duration::QUICK);
+        AddTestCase(new SteeredBeamCoverageEdgeTestCase, TestCase::Duration::QUICK);
+        AddTestCase(new L3FilterRateAdaptationTestCase, TestCase::Duration::QUICK);
+        AddTestCase(new VehicularHeadingKeepsRoadDirectionTestCase, TestCase::Duration::QUICK);
+        AddTestCase(new ChoExitTriggeredSelectionTestCase, TestCase::Duration::QUICK);
     }
 };
 

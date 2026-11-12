@@ -31,6 +31,7 @@
 #include <ns3/traced-callback.h>
 #include <ns3/vector.h>
 
+#include <map>
 #include <vector>
 
 namespace ns3
@@ -69,6 +70,10 @@ class NtnTteEstimator : public Object
         double exitGain_dB;      //!< Gain at the moment of exit
         double currentSinr_dB;   //!< Current SINR estimate
         bool isValid;            //!< Whether TTE computation succeeded
+        /// N1: expected usable time to exit, the integral of the line-of-sight
+        /// probability along the predicted pass up to the exit. Equal to tte
+        /// when no LOS-probability table is configured (line of sight assumed).
+        Time usable{Seconds(0)};
     };
 
     /**
@@ -108,11 +113,36 @@ class NtnTteEstimator : public Object
      * \param gainThreshold_dB Minimum gain for D1 condition validity (dB)
      * \return TteResult with estimated time-to-exit and quality metrics
      */
+    /// The look-ahead horizon. A TTE at this value is SATURATED: the exit lies
+    /// beyond where the estimator can see, so the number is a floor on the true
+    /// time-to-exit rather than a measurement of it. Two saturated TTEs are not
+    /// evidence that two cells are equally good, and a policy that compares them
+    /// has to know the difference.
+    Time GetMaxPredictionWindow() const { return m_maxPredictionWindow; }
+
     TteResult ComputeTte(GeoCoordinate uePosition,
                          Vector ueVelocity,
                          uint32_t satId,
                          uint32_t beamId,
                          double gainThreshold_dB) const;
+
+    /**
+     * \brief N1: LOS-probability table for the expected usable time to exit.
+     *
+     * \p pctByBin maps an elevation bin (10, 20, ..., 90 deg) to the
+     * line-of-sight probability in percent, e.g. TR 38.811 Table 6.6.1-1 for the
+     * terminal's environment class. When set, ComputeTte also returns
+     * TteResult::usable = sum over the coarse search steps of
+     * P_LOS(e(t_k)) * step (trapezoid), with e the elevation of the PREDICTED
+     * orbit seen from the projected terminal (WGS-84 normal), and the last
+     * partial step weighted at the last covered elevation. The bin of an
+     * elevation e is round(e / 10) * 10 clamped to [10, 90], the convention of
+     * the scenario's own LOS draw. An empty map (the default) means line of
+     * sight everywhere and usable == tte.
+     */
+    void SetLosProbabilityTable(const std::map<int, double>& pctByBin);
+    /// N1: P_LOS in [0, 1] for elevation \p elevDeg under the configured table.
+    double LosProbability(double elevDeg) const;
 
     /**
      * \brief Batch TTE computation for multiple candidate beams
@@ -126,6 +156,36 @@ class NtnTteEstimator : public Object
      * \param gainThreshold_dB Minimum gain for D1 condition validity
      * \return Vector of TteResults sorted by TTE descending (longest first)
      */
+    /**
+     * \brief Standard deviation of the predicted time-to-exit caused by
+     *        ephemeris uncertainty, by first-order error propagation.
+     *
+     * The predicted exit time is a function of the satellite state the
+     * prediction starts from. Perturbing that state by one standard deviation
+     * along each radial, along-track and cross-track axis in turn, and
+     * recomputing the exit, gives the three partial derivatives times their
+     * sigmas; their root-sum-square is the first-order sigma of the exit time.
+     * The perturbation is applied on top of any error already injected into
+     * the predictor and removed before returning.
+     *
+     * Along-track error is a pure time shift of the pass, so its contribution
+     * is sigmaAlong over the orbital speed at every geometry. Cross-track and
+     * radial error move the exit point along the boundary of the coverage cone,
+     * and their contribution grows without bound as the pass becomes grazing,
+     * which is why the margin is computed per pass rather than fixed.
+     *
+     * \return sigma in seconds; zero when every sigma is zero or the
+     *         satellite is not currently covering the terminal.
+     */
+    double ComputeTteSigma(GeoCoordinate uePosition,
+                           Vector ueVelocity,
+                           uint32_t satId,
+                           uint32_t beamId,
+                           double gainThreshold_dB,
+                           double sigmaRadialM,
+                           double sigmaAlongM,
+                           double sigmaCrossM) const;
+
     std::vector<TteResult> ComputeBatchTte(
         GeoCoordinate uePosition,
         Vector ueVelocity,
@@ -190,6 +250,7 @@ class NtnTteEstimator : public Object
      * \brief Binary search for distance-based exit time
      */
     Time FindDistanceExitTime(GeoCoordinate uePos,
+                              Vector ueVelocity,
                               uint32_t satId,
                               uint32_t beamId,
                               double distThreshold_m,
@@ -221,6 +282,7 @@ class NtnTteEstimator : public Object
 
 
 
+    std::map<int, double> m_plosPct;            //!< N1: LOS probability (%) by elevation bin
     Ptr<NtnOrbitPredictor> m_orbitPredictor;   //!< Orbit prediction engine
     Time m_predictionStep;                      //!< Coarse search step (default 1s)
     Time m_maxPredictionWindow;                 //!< Max look-ahead window (default 120s)

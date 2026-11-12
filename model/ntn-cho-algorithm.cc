@@ -323,6 +323,76 @@ NtnChoAlgorithm::ServingState() const
 }
 
 void
+NtnChoAlgorithm::UpdateCandidateElevation(uint16_t cellId, double elevationDeg)
+{
+    auto it = m_candidates.find(cellId);
+    if (it != m_candidates.end())
+    {
+        it->second.elevationDeg = elevationDeg;
+    }
+    if (cellId == m_servingCellId)
+    {
+        m_servingState.elevationDeg = elevationDeg;
+    }
+}
+
+void
+NtnChoAlgorithm::SeedCandidatePrediction(uint16_t cellId, Time tte, Time usable)
+{
+    auto it = m_candidates.find(cellId);
+    if (it == m_candidates.end())
+    {
+        return;
+    }
+    it->second.tte = tte;
+    it->second.usable = usable;
+    it->second.tteAt = tte;
+    it->second.usableAt = usable;
+    it->second.tteComputedAt = Simulator::Now();
+    it->second.tteUeEcef = m_uePosition.ToVector();
+}
+
+void
+NtnChoAlgorithm::RefreshPrediction(CandidateInfo& cand)
+{
+    const Time now = Simulator::Now();
+    const Vector ue = m_uePosition.ToVector();
+    bool recompute = (m_config.tteCacheRefresh <= Seconds(0)) || cand.tteComputedAt < Seconds(0) ||
+                     (now - cand.tteComputedAt >= m_config.tteCacheRefresh);
+    if (!recompute)
+    {
+        const double dx = ue.x - cand.tteUeEcef.x;
+        const double dy = ue.y - cand.tteUeEcef.y;
+        const double dz = ue.z - cand.tteUeEcef.z;
+        recompute = std::sqrt(dx * dx + dy * dy + dz * dz) > m_config.tteCacheMoveM;
+    }
+    if (recompute)
+    {
+        const auto r = m_tteEstimator->ComputeTte(m_uePosition, m_ueVelocity, cand.satId,
+                                                  cand.beamId, m_config.gainThreshold_dB);
+        ++m_tteEvalCount;
+        cand.tte = r.tte;
+        cand.usable = r.usable;
+        cand.tteAt = r.tte;
+        cand.usableAt = r.usable;
+        cand.tteComputedAt = now;
+        cand.tteUeEcef = ue;
+        return;
+    }
+    // Age the cached prediction. A saturated exit (at the horizon) stays
+    // saturated; the usable time ages at the candidate's current LOS rate.
+    const Time el = now - cand.tteComputedAt;
+    const Time horizon = m_tteEstimator->GetMaxPredictionWindow();
+    cand.tte = (cand.tteAt >= horizon) ? cand.tteAt : std::max(Seconds(0), cand.tteAt - el);
+    const double rate = (cand.tteAt > Seconds(0))
+                            ? cand.usableAt.GetSeconds() / cand.tteAt.GetSeconds()
+                            : 1.0;
+    cand.usable = (cand.tteAt >= horizon)
+                      ? cand.usableAt
+                      : std::max(Seconds(0), cand.usableAt - Seconds(rate * el.GetSeconds()));
+}
+
+void
 NtnChoAlgorithm::UpdateCandidateSlantRange(uint16_t cellId, double slantRangeM)
 {
     auto it = m_candidates.find(cellId);
@@ -440,6 +510,51 @@ NtnChoAlgorithm::EvaluateBeamDwell(CandidateInfo& cand)
 }
 
 void
+NtnChoAlgorithm::EvaluateEventA3(CandidateInfo& cand)
+{
+    // CHO-18: A3 had no A3 condition in it.
+    //
+    // The arm this replaces sat inside the D1-gated block and read, in full,
+    // "A3: admit based purely on SINR comparison" followed by an unconditional
+    // cand.admitted = true. There was no comparison. A3 admitted whatever the
+    // D1 location condition had already admitted, which made it a duplicate of
+    // TRIGGER_LOCATION_D1 wearing a measurement-event label, and tied a pure
+    // measurement event to a location condition TS 38.331 does not involve.
+    //
+    // TS 38.331 CondEventA3 entering condition (5.5.4.4):
+    //     Mn + Ofn + Ocn - Hys > Mp + Ofp + Ocp + Off
+    // with the per-cell and per-frequency offsets zero here, so it reduces to
+    // the neighbour beating the serving cell by a3Offset_dB, held for the
+    // time-to-trigger before the candidate is admitted.
+    cand.admitted = false;
+    cand.tte = Seconds(0); // A3 is a measurement event, it predicts nothing
+
+    const CandidateInfo* servingIt = ServingState();
+    if (!servingIt)
+    {
+        cand.a3MetSince = Seconds(-1.0);
+        return;
+    }
+    if (cand.cellId == m_servingCellId)
+    {
+        cand.a3MetSince = Seconds(-1.0);
+        return; // the serving cell is not a neighbour of itself
+    }
+
+    const bool entering = (cand.sinr_dB > servingIt->sinr_dB + m_config.a3Offset_dB);
+    if (!entering)
+    {
+        cand.a3MetSince = Seconds(-1.0); // leaving condition resets the TTT
+        return;
+    }
+    if (cand.a3MetSince < Seconds(0))
+    {
+        cand.a3MetSince = Simulator::Now();
+    }
+    cand.admitted = (Simulator::Now() - cand.a3MetSince >= m_config.a3TimeToTrigger);
+}
+
+void
 NtnChoAlgorithm::EvaluateStandardNtnTrigger(CandidateInfo& cand)
 {
     cand.admitted = false;
@@ -519,8 +634,15 @@ NtnChoAlgorithm::EvaluateStandardNtnTrigger(CandidateInfo& cand)
         {
             return;
         }
-        const double servingElev = ElevationFromSlantDeg(servingIt->slantRangeM);
-        const double candElev = ElevationFromSlantDeg(cand.slantRangeM);
+        // F7: the topocentric elevation when the scenario supplies it; the
+        // spherical slant-range relation only as a fallback (it reads about
+        // 0.4 deg low at 30 deg for a 6928 km shell against a 6371 km sphere).
+        const double servingElev = std::isfinite(servingIt->elevationDeg)
+                                       ? servingIt->elevationDeg
+                                       : ElevationFromSlantDeg(servingIt->slantRangeM);
+        const double candElev = std::isfinite(cand.elevationDeg)
+                                    ? cand.elevationDeg
+                                    : ElevationFromSlantDeg(cand.slantRangeM);
         cand.admitted = (!std::isnan(servingElev) && !std::isnan(candElev) &&
                          servingElev < m_config.elevationMinDeg &&
                          candElev >= m_config.elevationMinDeg + m_config.elevationHystDeg);
@@ -662,6 +784,13 @@ NtnChoAlgorithm::StartMonitoring(GeoCoordinate uePosition, Vector ueVelocity)
 }
 
 void
+NtnChoAlgorithm::UpdateUeKinematics(GeoCoordinate uePosition, Vector ueVelocity)
+{
+    m_uePosition = uePosition;
+    m_ueVelocity = ueVelocity;
+}
+
+void
 NtnChoAlgorithm::StopMonitoring()
 {
     NS_LOG_FUNCTION(this);
@@ -788,8 +917,26 @@ NtnChoAlgorithm::EvaluateConditions()
             continue;
         }
 
+        // CHO-18: A3 is a measurement event and is dispatched before the D1
+        // step, because gating it on the location condition is what turned it
+        // into a copy of TRIGGER_LOCATION_D1.
+        if (m_config.triggerType == TRIGGER_EVENT_A3)
+        {
+            EvaluateEventA3(cand);
+            m_candidateEvalTrace(cellId, cand.sinr_dB, cand.tte, cand.admitted);
+            if (cand.admitted && !m_admitCallback.IsNull())
+            {
+                m_admitCallback(cellId, cand.sinr_dB, cand.tte);
+            }
+            continue;
+        }
+
         // Step 1: Check D1 condition
-        bool d1Now = CheckD1Condition(cand);
+        // tteRequireD1 = false: an Earth-moving cell has no fixed reference
+        // location for D1 to measure against, so time-to-exit admission runs on
+        // quality and predicted exit alone.
+        const bool skipD1 = (m_config.triggerType == TRIGGER_TTE_AWARE && !m_config.tteRequireD1);
+        bool d1Now = skipD1 ? true : CheckD1Condition(cand);
 
         if (d1Now && !cand.d1Met)
         {
@@ -808,12 +955,7 @@ NtnChoAlgorithm::EvaluateConditions()
         {
             if (m_tteEstimator && m_config.triggerType == TRIGGER_TTE_AWARE)
             {
-                auto tteResult = m_tteEstimator->ComputeTte(
-                    m_uePosition, m_ueVelocity,
-                    cand.satId, cand.beamId,
-                    m_config.gainThreshold_dB);
-
-                cand.tte = tteResult.tte;
+                RefreshPrediction(cand);
 
                 // Admit if TTE >= minimum
                 cand.admitted = (cand.tte >= m_config.tteMinimum);
@@ -823,12 +965,6 @@ NtnChoAlgorithm::EvaluateConditions()
                 // Baseline: admit based on D1 + quality only (no TTE)
                 cand.admitted = true;
                 cand.tte = Seconds(0); // Unknown
-            }
-            else if (m_config.triggerType == TRIGGER_EVENT_A3)
-            {
-                // A3: admit based purely on SINR comparison
-                cand.admitted = true;
-                cand.tte = Seconds(0);
             }
             else if (m_config.triggerType == TRIGGER_THZ_BEAM_QUALITY)
             {
@@ -932,8 +1068,19 @@ NtnChoAlgorithm::SelectBestCandidate() const
 
     if (m_config.triggerType == TRIGGER_TIME_T1 ||
         m_config.triggerType == TRIGGER_ELEVATION ||
-        m_config.triggerType == TRIGGER_TIMING_ADVANCE)
+        m_config.triggerType == TRIGGER_TIMING_ADVANCE ||
+        m_config.triggerType == TRIGGER_DISTANCE_D2 ||
+        m_config.triggerType == TRIGGER_EVENT_A3 ||
+        m_config.triggerType == TRIGGER_LOCATION_D1)
     {
+        // CHO-19: D2, A3 and D1 reached the default rule below, which requires
+        // `tte >= tteMinimum`. All three deliberately set tte = 0, because none
+        // of them computes a time-to-exit: D2 is a distance condition, A3 a
+        // measurement event, D1 a location condition. So all three were admitted
+        // by their evaluator and then refused by a filter belonging to a
+        // different trigger, and could never be selected at any geometry. This
+        // is CHO-14 again, three more times.
+        //
         // The admit set already encodes the standardized condition; take the
         // strongest measured candidate.
         const CandidateInfo* bestStd = nullptr;
@@ -947,6 +1094,34 @@ NtnChoAlgorithm::SelectBestCandidate() const
         return bestStd ? bestStd->cellId : INVALID_CELL_ID;
     }
 
+    m_lastSelectViaNet = false;
+    // N1: the ranking score, the expected usable time when configured
+    const bool byUsable = m_config.rankByUsableTime;
+    const auto score = [byUsable](const CandidateInfo* c) { return byUsable ? c->usable : c->tte; };
+    const Time now = Simulator::Now();
+    // N3: the cell just left through the safety net is not a target for
+    // escapeHoldoff, unless nothing else is available
+    const bool holdActive = m_config.escapeHoldoff > Seconds(0) && m_escapedCell != 0 &&
+                            (now - m_escapedAt) < m_config.escapeHoldoff;
+    const auto applyHold = [&](std::vector<const CandidateInfo*>& v) {
+        if (!holdActive || v.size() <= 1)
+        {
+            return;
+        }
+        std::vector<const CandidateInfo*> w;
+        for (const CandidateInfo* c : v)
+        {
+            if (c->cellId != m_escapedCell)
+            {
+                w.push_back(c);
+            }
+        }
+        if (!w.empty())
+        {
+            v.swap(w);
+        }
+    };
+
     std::vector<const CandidateInfo*> admissible;
 
     for (const auto& [cellId, info] : m_candidates)
@@ -959,6 +1134,173 @@ NtnChoAlgorithm::SelectBestCandidate() const
             admissible.push_back(&info);
         }
     }
+    applyHold(admissible);
+
+    // Sort by the ranking score, descending
+    std::sort(admissible.begin(), admissible.end(),
+              [&score](const CandidateInfo* a, const CandidateInfo* b) {
+                  return score(a) > score(b);
+              });
+
+    // Exit-triggered execution: stay until the serving cell is about to be
+    // lost, then take the admissible candidate with the best score. The
+    // serving cell's exit and its sigma are recomputed at every evaluation.
+    if (m_config.tteExitTriggered && m_tteEstimator)
+    {
+        const CandidateInfo* servingIt = ServingState();
+        if (servingIt)
+        {
+            const auto servingTte = m_tteEstimator->ComputeTte(m_uePosition,
+                                                               m_ueVelocity,
+                                                               servingIt->satId,
+                                                               servingIt->beamId,
+                                                               m_config.gainThreshold_dB);
+            ++m_tteEvalCount;
+            // No serving measurement yet means the quality is unknown, not lost:
+            // the member's initial value is a sentinel, and reading it as a
+            // collapsed link handed every freshly attached terminal over at once.
+            const bool belowFloor = !m_servingSinrHistory.empty() &&
+                                    m_servingSinr_dB < m_config.tteServingFloor_dB;
+            if (!belowFloor)
+            {
+                m_servingBelowFloorSince = Seconds(-1);
+            }
+            else if (m_servingBelowFloorSince < Seconds(0))
+            {
+                m_servingBelowFloorSince = now;
+            }
+            const bool qualityLost =
+                belowFloor && (now - m_servingBelowFloorSince >= m_config.tteServingFloorTtt);
+            Time margin = m_config.tteExitMargin;
+            double sigR = m_config.ephSigmaRadialM;
+            double sigA = m_config.ephSigmaAlongM;
+            double sigC = m_config.ephSigmaCrossM;
+            if (!m_ephSigmaProvider.IsNull())
+            {
+                const Vector sig = m_ephSigmaProvider(servingIt->satId);
+                sigR = sig.x;
+                sigA = sig.y;
+                sigC = sig.z;
+            }
+            if (sigR > 0.0 || sigA > 0.0 || sigC > 0.0)
+            {
+                const double sigmaS = m_tteEstimator->ComputeTteSigma(m_uePosition,
+                                                                      m_ueVelocity,
+                                                                      servingIt->satId,
+                                                                      servingIt->beamId,
+                                                                      m_config.gainThreshold_dB,
+                                                                      sigR,
+                                                                      sigA,
+                                                                      sigC);
+                m_tteEvalCount += 7;
+                margin += Seconds(m_config.tteMarginZ * sigmaS);
+            }
+            m_lastExitMargin = margin;
+            m_lastServingTte = servingTte.tte;
+            m_plannedTarget = admissible.empty() ? INVALID_CELL_ID : admissible.front()->cellId;
+            if (!qualityLost && servingTte.tte > margin)
+            {
+                return INVALID_CELL_ID; // serving cell still has life left
+            }
+            if (qualityLost)
+            {
+                // F2: the serving link is lost, so any candidate that meets the
+                // quality floor beats staying. tau_min and the better-than-
+                // serving test describe a planned exit, not an escape; applying
+                // them here left a terminal on a dead link whenever no candidate
+                // had ten seconds of predicted coverage left.
+                // F23: nor does an escape require time left inside the
+                // quality-feasible contour. tte is the time to exit e_Q, so with
+                // e_Q = 40 deg every strong satellite below 40 deg has tte = 0 and
+                // was excluded; the terminal then stayed on its blocked link
+                // until radio link failure (urban: 9.4 RLF per terminal-hour at
+                // e_Q = 40 deg against 0.6 at 25 deg). Prepared candidates are
+                // covering satellites (the scenario releases those that leave
+                // coverage), so every prepared candidate above the floor is
+                // admissible; ties of the score, frequent at 0, go to the
+                // strongest candidate.
+                std::vector<const CandidateInfo*> pool;
+                for (const auto& [cellId, info] : m_candidates)
+                {
+                    if (cellId != m_servingCellId && info.d1Met &&
+                        info.sinr_dB >= m_config.qualityThreshold_dB)
+                    {
+                        pool.push_back(&info);
+                    }
+                }
+                if (m_config.escapeByQuality)
+                {
+                    // R2: the strongest candidate that is better than the
+                    // serving link, as the standardized fallback does.
+                    pool.erase(std::remove_if(pool.begin(), pool.end(),
+                                              [&](const CandidateInfo* c) {
+                                                  return !(c->sinr_dB > m_servingSinr_dB);
+                                              }),
+                               pool.end());
+                }
+                applyHold(pool);
+                if (pool.empty())
+                {
+                    return INVALID_CELL_ID;
+                }
+                if (m_config.escapeByQuality)
+                {
+                    const CandidateInfo* bestQ = *std::max_element(
+                        pool.begin(), pool.end(), [](const CandidateInfo* a, const CandidateInfo* b) {
+                            return a->sinr_dB < b->sinr_dB;
+                        });
+                    m_lastSelectViaNet = true;
+                    return bestQ->cellId;
+                }
+                // An escape answers a measured loss, which the ephemeris cannot
+                // see. Ranking every candidate above the floor by predicted
+                // (usable) time picked weak, long-lived targets that were often
+                // faded or blocked themselves, and the handover failed at
+                // completion (97 % of the rule's failures were escapes). With
+                // escapeNearBestDb >= 0 the ranking is restricted to candidates
+                // within that margin of the strongest one.
+                if (m_config.escapeNearBestDb >= 0.0)
+                {
+                    double strongest = -1e300;
+                    for (const CandidateInfo* c : pool)
+                    {
+                        strongest = std::max(strongest, c->sinr_dB);
+                    }
+                    pool.erase(std::remove_if(pool.begin(), pool.end(),
+                                              [&](const CandidateInfo* c) {
+                                                  return c->sinr_dB < strongest - m_config.escapeNearBestDb;
+                                              }),
+                               pool.end());
+                }
+                const CandidateInfo* best = *std::max_element(
+                    pool.begin(), pool.end(), [&score](const CandidateInfo* a, const CandidateInfo* b) {
+                        const auto sa = score(a);
+                        const auto sb = score(b);
+                        if (sa != sb)
+                        {
+                            return sa < sb;
+                        }
+                        return a->sinr_dB < b->sinr_dB;
+                    });
+                m_lastSelectViaNet = true;
+                NS_LOG_INFO("TTE safety-net selection: cell " << best->cellId);
+                return best->cellId;
+            }
+            if (admissible.empty())
+            {
+                return INVALID_CELL_ID;
+            }
+            const CandidateInfo* best = admissible.front();
+            if (best->tte <= servingTte.tte)
+            {
+                return INVALID_CELL_ID; // nothing outlives the cell we are on
+            }
+            NS_LOG_INFO("TTE exit-triggered selection: cell " << best->cellId << " (TTE="
+                        << best->tte.GetSeconds() << " s, serving TTE="
+                        << servingTte.tte.GetSeconds() << " s)");
+            return best->cellId;
+        }
+    }
 
     if (admissible.empty())
     {
@@ -966,11 +1308,43 @@ NtnChoAlgorithm::SelectBestCandidate() const
         return INVALID_CELL_ID;
     }
 
-    // Sort by TTE descending
-    std::sort(admissible.begin(), admissible.end(),
-              [](const CandidateInfo* a, const CandidateInfo* b) {
-                  return a->tte > b->tte;
-              });
+    if (m_config.requireBetterThanServing && m_tteEstimator && !m_config.tteExitTriggered)
+    {
+        const CandidateInfo* servingIt = ServingState();
+        if (servingIt)
+        {
+            const auto servingTte = m_tteEstimator->ComputeTte(m_uePosition,
+                                                               m_ueVelocity,
+                                                               servingIt->satId,
+                                                               servingIt->beamId,
+                                                               m_config.gainThreshold_dB);
+            const Time bestTte = admissible.front()->tte;
+
+            // A19b: a tie AT THE PREDICTION HORIZON carries no information.
+            //
+            // The first version of this check declined whenever the serving TTE
+            // was at least the best candidate's, and that turned "prefer staying
+            // on a tie" into "never hand over": measured over a 600 s pass it
+            // declined every single switch, because both sides sit at the 120 s
+            // horizon for most of the pass and equality at a cap is an artifact
+            // of where the estimator stops looking, not a statement that the two
+            // cells are equally good.
+            //
+            // When both are saturated the comparison is skipped and selection
+            // falls through to the ranking below. The rule only declines when it
+            // can actually see both exits.
+            const Time horizon = m_tteEstimator->GetMaxPredictionWindow();
+            const Time margin = MilliSeconds(100);
+            const bool bothSaturated = (servingTte.tte + margin >= horizon) &&
+                                       (bestTte + margin >= horizon);
+            if (!bothSaturated && servingTte.tte >= bestTte)
+            {
+                NS_LOG_DEBUG("staying: serving TTE " << servingTte.tte.GetSeconds()
+                             << " s >= best candidate " << bestTte.GetSeconds() << " s");
+                return INVALID_CELL_ID;
+            }
+        }
+    }
 
     // Tie-breaking: within epsilon of the best TTE, pick highest SINR
     const CandidateInfo* best = admissible[0];
@@ -1055,6 +1429,14 @@ NtnChoAlgorithm::ExecuteHandover(uint16_t targetCellId)
         NS_LOG_WARN("Cannot execute HO to invalid cell");
         m_handoverOutcomeTrace(targetCellId, false, "InvalidTarget");
         return;
+    }
+
+    // N3: remember the cell left through the safety net
+    if (m_lastSelectViaNet)
+    {
+        m_escapedCell = m_servingCellId;
+        m_escapedAt = Simulator::Now();
+        m_lastSelectViaNet = false;
     }
 
     // Record Time-of-Stay from last handover
@@ -1223,6 +1605,12 @@ NtnChoAlgorithm::NotifyHandoverComplete(uint16_t cellId, bool success)
         return;
     }
 
+    // CHO-20: remember the cell we are leaving, and its live geometry, before
+    // the serving id moves. It becomes a neighbour the moment this completes.
+    const uint16_t previousServing = m_servingCellId;
+    const CandidateInfo previousServingState = m_servingState;
+    const bool havePreviousServingState = m_haveServingState;
+
     m_servingCellId = cellId;
     m_handoverOutcomeTrace(cellId, true, m_pendingPingPong ? "PingPong" : "Success");
     TransitionState(CHO_COMPLETED);
@@ -1247,6 +1635,34 @@ NtnChoAlgorithm::NotifyHandoverComplete(uint16_t cellId, bool success)
         }
     }
     m_candidates.erase(cellId);
+
+    // CHO-20: re-arm the cell we just left, which is what actually drained the
+    // candidate map.
+    //
+    // GAP H3 above stopped clearing every candidate and kept "the rest" armed.
+    // In a two-cell scenario there is no rest: the map holds {A, B}, the UE is
+    // on A, a handover to B erases B, a handover back to A erases A, and from
+    // the second execution onward the map is EMPTY for the remainder of the
+    // run. Every trigger then evaluates nothing and SelectBestCandidate returns
+    // INVALID_CELL_ID at every tick regardless of geometry, which is why all six
+    // trigger classes produced byte-identical output: none of them was running.
+    //
+    // Rel-17 keeps prepared candidates across an execution, and the cell just
+    // vacated is a legitimate neighbour, so put it back with the geometry the
+    // serving record was carrying and its condition timers reset.
+    if (previousServing != INVALID_CELL_ID && previousServing != cellId &&
+        m_candidates.find(previousServing) == m_candidates.end() &&
+        m_candidates.size() < m_config.maxCandidates)
+    {
+        CandidateInfo back = havePreviousServingState ? previousServingState : CandidateInfo{};
+        back.cellId = previousServing;
+        back.admitted = false;
+        back.d1Met = false;
+        back.tte = Seconds(0);
+        back.a3MetSince = Seconds(-1.0);
+        back.a4MetSince = Seconds(-1.0);
+        m_candidates[previousServing] = back;
+    }
     TransitionState(CHO_IDLE);
 }
 
@@ -1292,6 +1708,12 @@ void
 NtnChoAlgorithm::SetHandoverExecutionCallback(HandoverExecutionCallback cb)
 {
     m_hoCallback = cb;
+}
+
+void
+NtnChoAlgorithm::SetEphSigmaProvider(EphSigmaProvider cb)
+{
+    m_ephSigmaProvider = cb;
 }
 
 void
@@ -1381,6 +1803,20 @@ NtnChoAlgorithm::GetCandidateReferenceIsSatellite(uint16_t cellId) const
     auto it = m_candidates.find(cellId);
     return it != m_candidates.end() &&
            it->second.referenceKind == CandidateInfo::ReferenceKind::SatelliteEphemeris;
+}
+
+bool
+NtnChoAlgorithm::IsCandidateAdmitted(uint16_t cellId) const
+{
+    auto it = m_candidates.find(cellId);
+    return it != m_candidates.end() && it->second.admitted;
+}
+
+Time
+NtnChoAlgorithm::GetCandidateTte(uint16_t cellId) const
+{
+    auto it = m_candidates.find(cellId);
+    return it == m_candidates.end() ? Seconds(0) : it->second.tte;
 }
 
 void

@@ -1,0 +1,143 @@
+{
+ "rule": "lowest mean HO rate among settings with mean outage <= 1.05 x the family's lowest mean outage in that environment; ties to the reference setting",
+ "choice": {
+  "tted2f/los": "tted2f_30_40",
+  "tted2f/suburban": "tted2f_30_40",
+  "tted2f/urban": "tted2f_25_35",
+  "tted2f/denseurban": "tted2f_25_35",
+  "geof/los": "geof_h200",
+  "geof/suburban": "geof_h200",
+  "geof/urban": "geof_h200",
+  "geof/denseurban": "geof_h200"
+ },
+ "table": {
+  "tted2f/los": {
+   "tted2f_35_45": [
+    0.4158,
+    0.061
+   ],
+   "tted2f_25_35": [
+    0.3559,
+    0.157
+   ],
+   "tted2f_30_40": [
+    0.38280000000000003,
+    0.057999999999999996
+   ]
+  },
+  "tted2f/suburban": {
+   "tted2f_35_45": [
+    0.8237,
+    0.576
+   ],
+   "tted2f_25_35": [
+    0.7509,
+    0.639
+   ],
+   "tted2f_30_40": [
+    0.7765,
+    0.571
+   ]
+  },
+  "tted2f/urban": {
+   "tted2f_35_45": [
+    2.6972,
+    2.238
+   ],
+   "tted2f_25_35": [
+    2.525,
+    2.349
+   ],
+   "tted2f_30_40": [
+    2.6111,
+    2.281
+   ]
+  },
+  "tted2f/denseurban": {
+   "tted2f_35_45": [
+    4.7999,
+    3.95
+   ],
+   "tted2f_25_35": [
+    4.3699,
+    4.059
+   ],
+   "tted2f_30_40": [
+    4.5874,
+    3.9939999999999998
+   ]
+  },
+  "geof/los": {
+   "geof_h10": [
+    0.8743,
+    0.131
+   ],
+   "geof_h50": [
+    0.8004,
+    0.119
+   ],
+   "geof_h100": [
+    0.7232999999999999,
+    0.106
+   ],
+   "geof_h200": [
+    0.5691,
+    0.08499999999999999
+   ]
+  },
+  "geof/suburban": {
+   "geof_h10": [
+    1.7913000000000001,
+    0.667
+   ],
+   "geof_h50": [
+    1.5485,
+    0.633
+   ],
+   "geof_h100": [
+    1.3434,
+    0.609
+   ],
+   "geof_h200": [
+    1.0484,
+    0.586
+   ]
+  },
+  "geof/urban": {
+   "geof_h10": [
+    4.3487,
+    1.998
+   ],
+   "geof_h50": [
+    3.9019,
+    1.984
+   ],
+   "geof_h100": [
+    3.5411,
+    2.0060000000000002
+   ],
+   "geof_h200": [
+    3.043,
+    2.078
+   ]
+  },
+  "geof/denseurban": {
+   "geof_h10": [
+    7.596,
+    3.721
+   ],
+   "geof_h50": [
+    6.9845,
+    3.721
+   ],
+   "geof_h100": [
+    6.3873,
+    3.732
+   ],
+   "geof_h200": [
+    5.5129,
+    3.783
+   ]
+  }
+ }
+}

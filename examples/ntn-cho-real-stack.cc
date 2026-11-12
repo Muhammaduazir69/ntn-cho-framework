@@ -129,6 +129,12 @@ ChoTick()
     const double servGain = std::max(-20.0, (servElev - 45.0) / 5.0);
     const double candGain = std::max(-20.0, (candElev - 45.0) / 5.0);
 
+    // CHO-21, same defect as ntn-cho-handover-traffic. D1, D2, T1 and the TTE
+    // estimator evaluate against m_uePosition, and this scenario never set it,
+    // so every geometric trigger it offers was measuring from a
+    // default-constructed coordinate while the radio flew the real orbit.
+    g_cho->UpdateUeKinematics(GeoCoordinate(u), g_ueMob->GetVelocity());
+
     g_cho->UpdateMeasurement(g_servingCellId, servSinr, servGain);
     g_cho->UpdateMeasurement(g_candCellId, candSinr, candGain);
     // Live ephemeris slant ranges -> RACH-less TA pre-compensation (RCHO).
@@ -176,7 +182,8 @@ main(int argc, char* argv[])
     uint32_t numUes = 2;
     double altitudeKm = 550.0;
     double satEirpDbm = -1.0; // sentinel: backend-appropriate default chosen below
-    double freqGhz = 2.0;
+    double freqGhz = 2.185; // TS 38.101-5 n256 downlink block (2170-2200 MHz). Was 2.0,
+                              // which is n256 UPLINK and never conformant as a DL carrier.
     double tteMinSec = 3.0;
     std::string radio = "nr"; // radio spine: "nr" (5G-LENA FR1) | "mmwave" (FR2)
     std::string trigger = "pcho";

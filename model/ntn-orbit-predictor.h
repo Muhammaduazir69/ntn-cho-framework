@@ -71,6 +71,38 @@ class NtnOrbitPredictor : public Object
     /// none is refused rather than silently accepted.
     void SetKinematicsSource(uint32_t satId, Ptr<MobilityModel> mob);
 
+    /// Inject a known ephemeris error for \p satId, in the satellite's own
+    /// radial / along-track / cross-track (RTN) frame, in metres.
+    ///
+    /// A ground network predicts from broadcast or catalogue ephemeris, not from
+    /// the satellite's true state, and SGP4 element sets drift mostly along
+    /// track as they age. This offset is added to the position read from the
+    /// kinematics source every time the predictor looks at it, so every
+    /// prediction (time-to-exit, moving reference, elevation) is made from the
+    /// erroneous state while the scenario's own mobility model keeps the true
+    /// orbit. The difference between the two is what a study of ephemeris
+    /// sensitivity measures. The velocity is left as reported, which is the
+    /// first-order effect of a stale element set: position error dominates over
+    /// the prediction horizons a handover uses.
+    ///
+    /// \param satId satellite identifier as registered with SetKinematicsSource
+    /// \param radialM radial offset, positive away from the Earth
+    /// \param alongM along-track offset, positive in the direction of motion
+    /// \param crossM cross-track offset, positive along the orbit normal r x v
+    void SetEphemerisErrorRtn(uint32_t satId, double radialM, double alongM, double crossM);
+
+    /// Remove every injected ephemeris error.
+    void ClearEphemerisErrors();
+
+    /// Injected ephemeris error for \p satId as (radial, along, cross) metres;
+    /// zero when none was injected.
+    Vector GetEphemerisErrorRtn(uint32_t satId) const;
+
+    /// Position the predictor believes \p satId occupies now: the kinematics
+    /// source plus any injected RTN error. False when the satellite has no
+    /// kinematics source.
+    bool GetPredictedSatEcef(uint32_t satId, Vector& pos, Vector& vel) const;
+
     /// CHO-2: use an analytic TR 38.811 Section 6.4.1 aperture beam instead of
     /// the SNS3 antenna-gain-pattern grid.
     ///
@@ -100,6 +132,18 @@ class NtnOrbitPredictor : public Object
     /// \param scanLossExponent cos^n scan-loss law; 1.2 is the usual planar-array value.
     void SetSteeredBeam(bool steered, double scanLossExponent = 1.2);
 
+    /// F13: index the steered-beam scan loss by the terminal's TOPOCENTRIC
+    /// elevation (WGS-84 normal) rather than by the instantaneous off-nadir
+    /// angle. The cos^n law is then evaluated at the off-nadir angle a
+    /// satellite at \p nominalAltM on a 6371 km sphere would have at that
+    /// elevation, which is exactly the geometry GainThresholdForMinElevationDb
+    /// inverts. A threshold derived for e_min therefore cuts coverage at a true
+    /// elevation of e_min for every terminal latitude and azimuth. Off-nadir
+    /// indexing put the edge at about 24.9 deg for a nominal 25 deg, because the
+    /// shell radius (6928 km) and the 6371 km threshold sphere disagree, and
+    /// the geocentric horizon tilts against the geodetic one with azimuth.
+    void SetSteeredBeamElevationIndexed(bool on, double nominalAltM);
+
     /// CHO-2b: the beam gain, in dB, that corresponds to a terminal at
     /// \p minElevDeg elevation seeing a satellite at \p satAltM.
     ///
@@ -112,6 +156,15 @@ class NtnOrbitPredictor : public Object
     /// and ties it to a documented figure (TR 38.821 uses a 10 degree cell
     /// edge) rather than to a number tuned until the output looked reasonable.
     double GainThresholdForMinElevationDb(double minElevDeg, double satAltM) const;
+
+    /// R2: radius of the sphere on which the elevation-indexed beam and
+    /// GainThresholdForMinElevationDb map elevation to scan angle. Default
+    /// 6371 km (mean radius) for backward compatibility; a scenario whose
+    /// orbits and text use the WGS-84 equatorial radius sets 6378.137 km so
+    /// one constant serves both. The round trip elevation -> gain -> elevation
+    /// is exact for any value.
+    void SetReferenceEarthRadius(double radiusM) { m_refEarthRadiusM = radiusM; }
+    double GetReferenceEarthRadius() const { return m_refEarthRadiusM; }
 
     /// True when the analytic beam is in use rather than the pattern grid.
     bool UsingGeometricBeam() const { return m_geometricBeam; }
@@ -287,11 +340,18 @@ class NtnOrbitPredictor : public Object
     bool ResolveSatPosition(uint32_t satId, GeoCoordinate& out) const;
     /// CHO-2: real kinematics per satellite, when supplied.
     std::map<uint32_t, Ptr<MobilityModel>> m_kinematics;
+    /// Injected ephemeris error per satellite, RTN metres (radial, along, cross).
+    std::map<uint32_t, Vector> m_ephErrorRtn;
+    /// Kinematics-source position with the injected ephemeris error applied.
+    Vector KinematicsPosition(uint32_t satId, const Ptr<MobilityModel>& mob) const;
     bool m_geometricBeam{false};      ///< CHO-2: analytic beam instead of the pattern grid
     double m_beamPeakGainDbi{30.0};   ///< CHO-2: boresight gain when analytic
     double m_beam3dbDeg{4.4127};      ///< CHO-2: full 3 dB beamwidth when analytic
     bool m_steeredBeam{false};        ///< CHO-2: boresight tracks the terminal
     double m_scanLossExp{1.2};        ///< CHO-2: cos^n scan-loss exponent
+    bool m_elevIndexed{false};        ///< F13: scan loss indexed by topocentric elevation
+    double m_refEarthRadiusM{6371000.0}; ///< R2: sphere of the elevation/scan mapping
+    double m_elevIndexedAltM{550e3};  ///< F13: nominal altitude of that mapping
 
   protected:
     void DoDispose() override;
