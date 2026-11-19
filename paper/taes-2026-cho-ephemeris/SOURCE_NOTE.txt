@@ -1,0 +1,11 @@
+Comment-only edit: comments and docstrings of the archived copies were edited to drop internal
+bookkeeping tags. Code is unchanged: for each C++ file below, the SHA-256 of its comment-free token
+stream (cpp -fpreprocessed -P -w FILE | sha256sum) is the same before and after the edit.
+
+Unedited source files (as logged in the run log):
+3b0e7840710803da466bd1fb6a60231839ec53fd4acca8ba2e7957ed47503ed9  ns3_patch/orig/ntn-cho-tte-campaign.cc
+47cb7928d7d065626eee2141ccf98d56336c567409e43096ab78112b3f37ca81  ns3_patch/ntn-cho-tte-campaign.cc
+
+Comment-free token streams (recompute from the copies in this archive):
+bffcb6cc4a80fa625d4af88af4308ea1dae149111c181c6cde0597861d7e569c  ns3_patch/orig/ntn-cho-tte-campaign.cc
+924ab50b11e0af0a92880ad6c2576609d886dd29d44a689e9078e5fef6f56c52  ns3_patch/ntn-cho-tte-campaign.cc
