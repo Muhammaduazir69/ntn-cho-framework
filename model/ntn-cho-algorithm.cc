@@ -593,9 +593,13 @@ NtnChoAlgorithm::EvaluateStandardNtnTrigger(CandidateInfo& cand)
         // condition wearing a 3GPP label.
         if (m_config.t1ThresholdEpoch > Seconds(0))
         {
-            const Time now = Simulator::Now();
-            cand.admitted = (now >= m_config.t1ThresholdEpoch &&
-                             now < m_config.t1ThresholdEpoch + m_config.t1WindowDuration);
+            // Wave 6A: evaluate the IE as signalled, t1-Threshold in 10 ms UTC
+            // units since 1900 and duration in 100 ms units, against the UE's
+            // UTC clock (TS 38.331 5.5.4.16: enter Mt > Thresh1, leave
+            // Mt > Thresh1 + Duration).
+            const CondEventT1Ie ie = GetCondEventT1Ie();
+            cand.admitted =
+                ie.IsInside(m_config.utcEpochUnixS + Simulator::Now().GetSeconds());
             break;
         }
 
@@ -1172,17 +1176,26 @@ NtnChoAlgorithm::SelectBestCandidate() const
             const bool qualityLost =
                 belowFloor && (now - m_servingBelowFloorSince >= m_config.tteServingFloorTtt);
             Time margin = m_config.tteExitMargin;
-            if (m_config.ephSigmaRadialM > 0.0 || m_config.ephSigmaAlongM > 0.0 ||
-                m_config.ephSigmaCrossM > 0.0)
+            double sigR = m_config.ephSigmaRadialM;
+            double sigA = m_config.ephSigmaAlongM;
+            double sigC = m_config.ephSigmaCrossM;
+            if (!m_ephSigmaProvider.IsNull())
+            {
+                const Vector sig = m_ephSigmaProvider(servingIt->satId);
+                sigR = sig.x;
+                sigA = sig.y;
+                sigC = sig.z;
+            }
+            if (sigR > 0.0 || sigA > 0.0 || sigC > 0.0)
             {
                 const double sigmaS = m_tteEstimator->ComputeTteSigma(m_uePosition,
                                                                       m_ueVelocity,
                                                                       servingIt->satId,
                                                                       servingIt->beamId,
                                                                       m_config.gainThreshold_dB,
-                                                                      m_config.ephSigmaRadialM,
-                                                                      m_config.ephSigmaAlongM,
-                                                                      m_config.ephSigmaCrossM);
+                                                                      sigR,
+                                                                      sigA,
+                                                                      sigC);
                 m_tteEvalCount += 7;
                 margin += Seconds(m_config.tteMarginZ * sigmaS);
             }
@@ -1465,6 +1478,13 @@ NtnChoAlgorithm::ExecuteHandover(uint16_t targetCellId)
         // TA from ephemeris and GNSS (TS 38.821 section 6.3.3).
         m_mechStats.lastRachTraversals = 0;
         m_mechStats.lastRachPropagationMs = 0.0;
+        // P0-8: the RRCReconfigurationComplete leg on the configured grant
+        // (TS 38.300 9.2.3.2) is one UE-to-target traversal; skipping the RACH
+        // does not skip it.
+        if (m_config.countRachLessCompletion)
+        {
+            interruptionMs += targetIt->second.slantRangeM / 299792458.0 * 1e3;
+        }
         ++m_mechStats.rachLessExecutions;
         // CHO-12: hand the pre-compensation to whoever owns timing advance.
         // Without this the value stopped in a stats struct and RACH-less
@@ -1702,6 +1722,12 @@ NtnChoAlgorithm::SetHandoverExecutionCallback(HandoverExecutionCallback cb)
 }
 
 void
+NtnChoAlgorithm::SetEphSigmaProvider(EphSigmaProvider cb)
+{
+    m_ephSigmaProvider = cb;
+}
+
+void
 NtnChoAlgorithm::SetCandidateAdmittedCallback(CandidateAdmittedCallback cb)
 {
     m_admitCallback = cb;
@@ -1725,7 +1751,58 @@ NtnChoAlgorithm::CheckD1Condition(const CandidateInfo& cand) const
     double dz = ueCart.z - bcCart.z;
     double dist = std::sqrt(dx * dx + dy * dy + dz * dz);
 
-    return (dist <= m_config.d1Threshold_m);
+    // Wave 6A: thresholds and hysteresis as signalled (50 m / 10 m steps),
+    // entering condition per TS 38.331 5.5.4.15.
+    const CondEventD1Ie ie = GetCondEventD1Ie();
+    if (!ie.CandidateLegMet(dist))
+    {
+        return false;
+    }
+    if (m_config.d1ServingThreshold_m >= 0.0)
+    {
+        const CandidateInfo* serving = ServingState();
+        if (!serving)
+        {
+            return false;
+        }
+        auto ss = m_orbitPredictor->GetBeamSnapshot(serving->satId, serving->beamId, m_uePosition);
+        const Vector sc = ss.beamCenter.ToVector();
+        const double ml1 = std::sqrt((ueCart.x - sc.x) * (ueCart.x - sc.x) +
+                                     (ueCart.y - sc.y) * (ueCart.y - sc.y) +
+                                     (ueCart.z - sc.z) * (ueCart.z - sc.z));
+        return ie.ServingLegMet(ml1);
+    }
+    return true;
+}
+
+CondEventT1Ie
+NtnChoAlgorithm::GetCondEventT1Ie() const
+{
+    bool clamped = false;
+    const CondEventT1Ie ie =
+        CondEventT1Ie::Encode(m_config.utcEpochUnixS + m_config.t1ThresholdEpoch.GetSeconds(),
+                              m_config.t1WindowDuration,
+                              &clamped);
+    if (clamped && !m_t1ClampWarned)
+    {
+        m_t1ClampWarned = true;
+        NS_LOG_WARN("condEventT1: configured window (duration "
+                    << m_config.t1WindowDuration.As(Time::S)
+                    << ") is outside the TS 38.331 range (duration 0.1-600 s); clamped to "
+                    << ie.DurationTime().As(Time::S));
+    }
+    return ie;
+}
+
+CondEventD1Ie
+NtnChoAlgorithm::GetCondEventD1Ie() const
+{
+    CondEventD1Ie ie;
+    ie.distanceThreshFromReference2 = CondEventD1Ie::EncodeThreshold(m_config.d1Threshold_m);
+    ie.distanceThreshFromReference1 =
+        CondEventD1Ie::EncodeThreshold(std::max(0.0, m_config.d1ServingThreshold_m));
+    ie.hysteresisLocation = CondEventD1Ie::EncodeHysteresis(m_config.d1HysteresisLocation_m);
+    return ie;
 }
 
 double

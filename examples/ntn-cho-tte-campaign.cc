@@ -109,6 +109,26 @@
  *   ue_summary.csv   one row per terminal
  *   events.csv       one row per handover or re-establishment
  *   tte_accuracy.csv (--mode=tte-accuracy) predicted vs realized exit times
+ *   nr_check/        (--nrCheckS > 0, campaign mode) the packet-level replay below
+ *
+ * PACKET-LEVEL REPLAY (Wave 7A, --nrCheckS, default 30 s, 0 = off)
+ *
+ *   The campaign itself is system level. After it, terminal 0's serving
+ *   timeline under the chosen policy (attach, each completed handover, each
+ *   re-establishment) is replayed, over an --nrCheckS window centred on its
+ *   first handover (or from t = 0 when it had none), on a measured 5G-LENA
+ *   NR-NTN data plane
+ *   (ntn-traffic NtnRealStackHelper, TR 38.821 Set-1 S-band link budget): every
+ *   satellite that served terminal 0 in the window becomes a gNB on its own
+ *   SGP4 orbit (same elements and epoch as the campaign), the terminal is a
+ *   TR 38.811 UE at terminal 0's position at the window start, SSB rides each satellite's
+ *   nadir cell beam, and each decision of the policy is executed as a real X2
+ *   handover (TriggerHandover, TS 38.331 reconfiguration with sync) at the time
+ *   the campaign completed it. A downlink CbrApplication (ntn-traffic) with an
+ *   in-band SeqTsSizeHeader measures delivery, delay, IPDV and the packet gap at
+ *   each handover. Outputs: nr_check/nr_check.csv (per packet gap summary),
+ *   ue_kpi.csv, cell_kpi.csv, sim_health.csv. The campaign outputs above are
+ *   written first and are unchanged.
  *
  * Example:
  *   ./ns3 run "ntn-cho-tte-campaign --policy=tte-cho --numUes=100 --simTime=600 \
@@ -129,15 +149,21 @@
 #include "ns3/sgp4-mobility-model.h"
 #include "ns3/three-gpp-propagation-loss-model.h"
 #include "ns3/walker-constellation.h"
+#include "ns3/applications-module.h"
+#include "ns3/internet-module.h"
+#include "ns3/ntn-traffic-module.h"
+#include "ns3/seq-ts-size-header.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <map>
+#include <numeric>
 #include <set>
 #include <sstream>
 #include <unordered_map>
@@ -286,6 +312,7 @@ struct Params
     double simTime = 600.0;
     uint32_t rngRun = 1;
     std::string outputDir = "ntn-cho-tte-campaign";
+    double nrCheckS = 30.0; // Wave 7A: packet-level replay of terminal 0 (0 = off)
     // constellation
     uint32_t totalSats = 1584;
     uint32_t numPlanes = 72;
@@ -369,6 +396,17 @@ struct Params
     //  (the rule of Noreen and Schotten, CCNC 2026, mapped onto moving cells).
     bool measFallback = false;
     bool tteRank = false;
+    // Recent-work baselines (Oct 2026), re-implemented from the published
+    // descriptions:
+    //  rankEntropy: among the admitted candidates above the quality floor, the
+    //  target maximizes an entropy-weighted score of filtered SINR and predicted
+    //  remaining service time (Wang et al., IEEE TVT 2026).
+    //  policy "geo": execute when the geodesic distance from the terminal to a
+    //  candidate's sub-satellite point, read from the broadcast ephemeris, is
+    //  shorter than to the serving satellite's by geoHysM; target is the nearest
+    //  such candidate (Lee and Kim, IEEE TVT 2026).
+    bool rankEntropy = false;
+    double geoHysM = 10000.0;
     // N1-N3 (new policies)
     bool rankByUsable = false;       // rank by expected usable time to exit
     bool prepareByTte = false;       // prepared set by predicted score, not by L3
@@ -393,6 +431,15 @@ struct Params
     std::string ephErrorFile;
     double ephAgeMinH = 0.0;
     double ephAgeMaxH = 1e9;
+    // Age-aware margin (round 4, pre-registered): CSV of the measured one-sigma
+    // RTN error by element-set age bin (age_lo_h,age_hi_h,n,s68_r_m,s68_a_m,
+    // s68_c_m). With marginByAge, tte-cho budgets each serving satellite by the
+    // sigmas of its element set's age bin instead of the assumed triple.
+    std::string ageSigmaTable;
+    bool marginByAge = false;
+    // Gaussian error with age: each satellite draws an age bin (weights n) and
+    // its copy a Gaussian RTN offset with that bin's sigmas (needs the table)
+    bool ephGaussByAge = false;
     // accuracy mode
     uint32_t accuracySamples = 2000;
     int32_t traceUe = -1; // write trace.csv for this terminal (1 s cadence)
@@ -425,6 +472,7 @@ struct UeCtx
 {
     Ptr<Node> node;
     Ptr<NtnTr38811MobilityModel> mob;
+    Vector startPos; // Wave 7A: ECEF position at t = 0 (packet-level replay)
     Ptr<NtnChoAlgorithm> cho;
     std::string ueClass;
     int env = kEnvLos;                // R2 (M8): environment of this terminal
@@ -474,6 +522,12 @@ struct UeCtx
 };
 
 std::vector<Ptr<Sgp4MobilityModel>> g_sats;
+/// Wave 7A: terminal 0's serving timeline (time s, satellite index; -1 = none).
+std::vector<std::pair<double, int32_t>> g_ue0Timeline;
+/// Wave 7A: terminal 0's position once per second, taken from the campaign's
+/// own measurement queries (an extra query would advance the Gauss-Markov
+/// motion engine and change the campaign).
+std::vector<std::pair<double, Vector>> g_ue0Track;
 std::vector<Vector> g_satPos; // ECEF at the current tick
 std::vector<UeCtx> g_ues;
 Ptr<NtnOrbitPredictor> g_pred;
@@ -484,6 +538,34 @@ Ptr<NtnTteEstimator> g_tteEnv[4];
 std::vector<Ptr<Sgp4MobilityModel>> g_net; // R2 (M10): the network's own copy of each orbit
 bool g_ephActive = false;                  // any ephemeris error injected
 std::vector<Vector> g_ephDrawn;            // R2: drawn RTN error per satellite at t = 0
+// Age-aware margin: the measured sigma table and the age (h) of the network's
+// element set of each satellite at t = 0 (real shell: start minus the GP epoch)
+struct AgeBin
+{
+    double lo;
+    double hi;
+    double n;
+    Vector sig; // (radial, along, cross), m
+};
+std::vector<AgeBin> g_ageTable;
+std::vector<double> g_satAge0H;
+bool g_marginByAge = false;
+
+Vector
+AgeSigmaOf(uint32_t sat)
+{
+    const double age = g_satAge0H.at(sat) + Simulator::Now().GetSeconds() / 3600.0;
+    // step lookup: the bin that contains the age; the first bin also takes
+    // negative ages and the last one is open
+    for (size_t k = 1; k < g_ageTable.size(); ++k)
+    {
+        if (age < g_ageTable[k].lo)
+        {
+            return g_ageTable[k - 1].sig;
+        }
+    }
+    return g_ageTable.back().sig;
+}
 Ptr<UniformRandomVariable> g_uni;
 Ptr<NormalRandomVariable> g_norm;
 double g_noiseDbm = 0.0;
@@ -600,6 +682,14 @@ UpdateSatPositions()
 void
 MeasureUe(UeCtx& u, const Vector& uePos)
 {
+    if (&u == &g_ues[0])
+    {
+        const double now = Simulator::Now().GetSeconds();
+        if (g_ue0Track.empty() || now >= g_ue0Track.back().first + 1.0)
+        {
+            g_ue0Track.emplace_back(now, uePos);
+        }
+    }
     // F14: TS 38.331 Section 5.5.3.2 defines a = 1/2^(k/4) for a 200 ms input
     // period and asks for the filter to be adapted so its time characteristics
     // are kept at other sampling rates: a_eff = 1 - (1 - a)^(T_s / 200 ms).
@@ -831,6 +921,98 @@ NetElevDeg(const UeCtx& u, uint32_t sat, const LinkState& ls)
     return ntngeo::GeodeticElevationDeg(u.tickPos, pp);
 }
 
+// Entropy weight method (Wang et al., IEEE TVT 2026): min-max normalize each
+// benefit attribute over the candidates, weight attribute j by 1 - E_j with E_j
+// its normalized Shannon entropy, and return the index of the largest score.
+size_t
+EntropyArgmax(const std::vector<double>& a, const std::vector<double>& b)
+{
+    const size_t n = a.size();
+    std::vector<std::vector<double>> x(2, std::vector<double>(n));
+    for (int j = 0; j < 2; ++j)
+    {
+        const auto& v = (j == 0) ? a : b;
+        const double lo = *std::min_element(v.begin(), v.end());
+        const double hi = *std::max_element(v.begin(), v.end());
+        for (size_t i = 0; i < n; ++i)
+        {
+            // a small floor keeps every share positive, as is usual for this method
+            x[j][i] = (hi > lo) ? 1e-3 + (v[i] - lo) / (hi - lo) : 1.0;
+        }
+    }
+    double w[2];
+    for (int j = 0; j < 2; ++j)
+    {
+        const double sum = std::accumulate(x[j].begin(), x[j].end(), 0.0);
+        double e = 0.0;
+        for (size_t i = 0; i < n; ++i)
+        {
+            const double q = x[j][i] / sum;
+            e -= q * std::log(q);
+        }
+        w[j] = 1.0 - e / std::log(static_cast<double>(n));
+    }
+    const double ws = w[0] + w[1];
+    const double w0 = (ws > 0.0) ? w[0] / ws : 0.5;
+    size_t best = 0;
+    double bestS = -1.0;
+    for (size_t i = 0; i < n; ++i)
+    {
+        const double sc = w0 * x[0][i] + (1.0 - w0) * x[1][i];
+        if (sc > bestS)
+        {
+            bestS = sc;
+            best = i;
+        }
+    }
+    return best;
+}
+
+// Geodesic distance (m) on the sphere of radius R_E between the terminal and
+// the sub-satellite point of a satellite at ECEF position r.
+double
+GeodesicToSubSatM(const Vector& ue, const Vector& r)
+{
+    const double nu = std::sqrt(ue.x * ue.x + ue.y * ue.y + ue.z * ue.z);
+    const double nr = std::sqrt(r.x * r.x + r.y * r.y + r.z * r.z);
+    const double c = (ue.x * r.x + ue.y * r.y + ue.z * r.z) / (nu * nr);
+    return kRe * std::acos(std::max(-1.0, std::min(1.0, c)));
+}
+
+// Lee and Kim (IEEE TVT 2026), as we read it: the terminal hands over when a
+// prepared candidate's sub-satellite point, from the broadcast ephemeris, is
+// closer than the serving one's by the hysteresis; the candidate must pass the
+// quality floor Q (the A4 leg of the other location conditions).
+uint16_t
+GeoTarget(const UeCtx& u)
+{
+    Vector pp;
+    Vector pv;
+    if (!g_pred->GetPredictedSatEcef(static_cast<uint32_t>(u.serving), pp, pv))
+    {
+        return NtnChoAlgorithm::INVALID_CELL_ID;
+    }
+    const double ds = GeodesicToSubSatM(u.tickPos, pp);
+    double best = ds - g_p.geoHysM;
+    uint16_t target = NtnChoAlgorithm::INVALID_CELL_ID;
+    for (uint32_t s : u.candidates)
+    {
+        const auto ls = u.links.find(s);
+        if (s == static_cast<uint32_t>(u.serving) || ls == u.links.end() || !ls->second.covered ||
+            ls->second.l3 < g_p.qualityThDb || !g_pred->GetPredictedSatEcef(s, pp, pv))
+        {
+            continue;
+        }
+        const double d = GeodesicToSubSatM(u.tickPos, pp);
+        if (d < best)
+        {
+            best = d;
+            target = CellOf(s);
+        }
+    }
+    return target;
+}
+
 double
 ExecMarginFor(const UeCtx& u)
 {
@@ -838,12 +1020,16 @@ ExecMarginFor(const UeCtx& u)
     // latency plus z sigma of the predicted exit, as NtnChoAlgorithm computes it.
     double m = g_p.execMarginS;
     const auto cfg = u.cho->GetConfig();
-    if (cfg.ephSigmaRadialM > 0.0 || cfg.ephSigmaAlongM > 0.0 || cfg.ephSigmaCrossM > 0.0)
+    Vector sig(cfg.ephSigmaRadialM, cfg.ephSigmaAlongM, cfg.ephSigmaCrossM);
+    if (g_marginByAge)
+    {
+        sig = AgeSigmaOf(static_cast<uint32_t>(u.serving)); // as the algorithm's provider
+    }
+    if (sig.x > 0.0 || sig.y > 0.0 || sig.z > 0.0)
     {
         m += g_p.marginZ * u.tte->ComputeTteSigma(GeoOf(u.tickPos), u.tickVel,
                                                   static_cast<uint32_t>(u.serving), 0,
-                                                  g_tteGainTh, cfg.ephSigmaRadialM,
-                                                  cfg.ephSigmaAlongM, cfg.ephSigmaCrossM);
+                                                  g_tteGainTh, sig.x, sig.y, sig.z);
     }
     return m;
 }
@@ -899,6 +1085,10 @@ RefreshT1(UeCtx& u)
 void
 Attach(UeCtx& u, int32_t sat)
 {
+    if (&u == &g_ues[0])
+    {
+        g_ue0Timeline.emplace_back(Simulator::Now().GetSeconds(), sat);
+    }
     u.serving = sat;
     u.connectedSince = Simulator::Now().GetSeconds();
     u.t310Start = -1.0;
@@ -921,6 +1111,10 @@ StartReestablishment(UeCtx& u, const std::string& cause)
 {
     const double now = Simulator::Now().GetSeconds();
     const int32_t from = u.serving;
+    if (&u == &g_ues[0])
+    {
+        g_ue0Timeline.emplace_back(now, -1);
+    }
     u.serving = -1;
     u.executing = false;
     u.reestablishing = true;
@@ -995,6 +1189,10 @@ CompleteHandover(size_t idx, uint32_t target, double tStart, double predServTte,
     u.prevServing = from;
     u.lastHoTime = tStart;
     u.serving = static_cast<int32_t>(target);
+    if (idx == 0)
+    {
+        g_ue0Timeline.emplace_back(now, static_cast<int32_t>(target));
+    }
     u.connectedSince = now;
     u.t310Start = -1.0;
     ArmT1(u);
@@ -1170,6 +1368,39 @@ Decide(size_t idx)
             u.rrcWinDirty = true;
             u.sigTarget = pt;
             u.sigEnd = end;
+        }
+    }
+    if (g_p.policy == "geo")
+    {
+        target = GeoTarget(u);
+    }
+    if (g_p.rankEntropy && !isTteFamily && target != NtnChoAlgorithm::INVALID_CELL_ID)
+    {
+        // Entropy weight method over two benefit attributes, filtered SINR and
+        // predicted remaining service time, of the admitted candidates.
+        std::vector<uint16_t> ids;
+        std::vector<double> a;
+        std::vector<double> b;
+        for (const auto& [cellId, info] : u.cho->GetCandidates())
+        {
+            if (!info.admitted || info.sinr_dB < g_p.qualityThDb ||
+                SatOf(cellId) == static_cast<uint32_t>(u.serving))
+            {
+                continue;
+            }
+            const auto ls = u.links.find(SatOf(cellId));
+            if (ls == u.links.end())
+            {
+                continue;
+            }
+            ids.push_back(cellId);
+            a.push_back(ls->second.l3);
+            b.push_back(
+                u.tte->ComputeTte(geo, u.tickVel, SatOf(cellId), 0, g_tteGainTh).tte.GetSeconds());
+        }
+        if (ids.size() > 1)
+        {
+            target = ids[EntropyArgmax(a, b)];
         }
     }
     if (g_p.tteRank && !isTteFamily && target != NtnChoAlgorithm::INVALID_CELL_ID)
@@ -1642,6 +1873,265 @@ ReadTleFile(const std::string& path)
 
 } // namespace
 
+/// In-band per-packet stats of the replay's downlink CBR flow, and the
+/// longest gap between consecutive receptions around each handover.
+struct ReplayFlow
+{
+    uint64_t rx{0};
+    uint64_t highestSeq{0};
+    bool any{false};
+    double sumDelayMs{0.0};
+    uint64_t lastSeq{0};
+    double lastDelayMs{0.0};
+    double lastRxS{-1.0};
+    uint64_t ipdvN{0};
+    double ipdvSumMs{0.0};
+    std::vector<std::pair<double, double>> gaps; ///< (time of the reception ending it, gap ms)
+
+    void Rx(Ptr<const Packet>, const Address&, const Address&, const SeqTsSizeHeader& h)
+    {
+        const double now = Simulator::Now().GetSeconds();
+        const double d = (Simulator::Now() - h.GetTs()).GetSeconds() * 1e3;
+        ++rx;
+        sumDelayMs += d;
+        if (any && h.GetSeq() == lastSeq + 1)
+        {
+            ipdvSumMs += std::fabs(d - lastDelayMs);
+            ++ipdvN;
+        }
+        if (lastRxS >= 0.0)
+        {
+            gaps.emplace_back(now, (now - lastRxS) * 1e3);
+        }
+        highestSeq = any ? std::max<uint64_t>(highestSeq, h.GetSeq()) : h.GetSeq();
+        any = true;
+        lastSeq = h.GetSeq();
+        lastDelayMs = d;
+        lastRxS = now;
+    }
+};
+
+/// Wave 7A: replay terminal 0's serving timeline on a packet-level NR-NTN data
+/// plane (see PACKET-LEVEL REPLAY in the file header).
+int
+RunNrReplay(const Params& p, const Vector& ue0Start)
+{
+    const double T = std::min(p.nrCheckS, p.simTime);
+    if (T < 5.0)
+    {
+        std::cout << "  nr replay: window " << T << " s is shorter than 5 s; skipped\n";
+        return 0;
+    }
+    // Window: centred on terminal 0's first executed handover when it had one,
+    // otherwise the first T seconds.
+    double t0 = 0.0;
+    for (size_t k = 1; k < g_ue0Timeline.size(); ++k)
+    {
+        if (g_ue0Timeline[k].second >= 0 && g_ue0Timeline[k - 1].second >= 0)
+        {
+            t0 = std::max(0.0, std::min(g_ue0Timeline[k].first - T / 2.0, p.simTime - T));
+            break;
+        }
+    }
+    // Serving satellite at t0, and the policy's changes inside [t0, t0 + T - 1].
+    std::vector<int32_t> sats;
+    std::vector<std::pair<double, int32_t>> plan; // (time since t0, sat) to execute
+    int32_t servingAtStart = -1;
+    uint32_t reestInWindow = 0;
+    for (const auto& [t, sat] : g_ue0Timeline)
+    {
+        if (t <= t0)
+        {
+            servingAtStart = sat;
+            continue;
+        }
+        if (t > t0 + T - 1.0)
+        {
+            break;
+        }
+        if (sat < 0)
+        {
+            ++reestInWindow;
+            continue;
+        }
+        if (servingAtStart < 0)
+        {
+            servingAtStart = sat;
+        }
+        else
+        {
+            plan.emplace_back(t - t0, sat);
+        }
+    }
+    if (servingAtStart >= 0)
+    {
+        sats.push_back(servingAtStart);
+    }
+    for (const auto& [t, sat] : plan)
+    {
+        if (std::find(sats.begin(), sats.end(), sat) == sats.end())
+        {
+            sats.push_back(sat);
+        }
+    }
+    // Terminal 0's position at t0 (campaign track, 1 s resolution).
+    Vector uePos = ue0Start;
+    for (const auto& [t, pos] : g_ue0Track)
+    {
+        if (t > t0)
+        {
+            break;
+        }
+        uePos = pos;
+    }
+    if (sats.empty())
+    {
+        std::cout << "  nr replay: terminal 0 was never served in [" << t0 << ", " << t0 + T
+                  << "] s; skipped\n";
+        return 0;
+    }
+    const std::string dir = p.outputDir + "/nr_check";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+
+    // gNBs: the serving satellites on their own SGP4 orbits, same elements and epoch.
+    NodeContainer gnbNodes;
+    gnbNodes.Create(sats.size());
+    std::map<int32_t, uint32_t> gnbOfSat;
+    for (size_t k = 0; k < sats.size(); ++k)
+    {
+        Ptr<Sgp4MobilityModel> m = CreateObject<Sgp4MobilityModel>();
+        m->SetElements(g_sats[sats[k]]->GetElements());
+        m->SetSimulationEpochUnix(g_sats[sats[k]]->SimBaseUnix() + t0);
+        gnbNodes.Get(k)->AggregateObject(m);
+        gnbOfSat[sats[k]] = static_cast<uint32_t>(k);
+    }
+    // UE: a TR 38.811 UE at terminal 0's start position.
+    double lat;
+    double lon;
+    double alt;
+    ntngeo::EcefToGeodetic(uePos, lat, lon, alt);
+    NodeContainer ueNodes;
+    ueNodes.Create(1);
+    NtnTr38811MobilityHelper ueHelper(static_cast<uint64_t>(p.rngRun));
+    ueHelper.Install(ueNodes,
+                     NtnMobilityScenarios::MixedContinental(),
+                     lat - 0.001,
+                     lat + 0.001,
+                     lon - 0.001,
+                     lon + 0.001);
+
+    NtnRealStackHelper rs;
+    rs.SetRadioBackend(NtnRealStackHelper::RadioBackend::Nr);
+    rs.SetNumerology(1);
+    rs.SetSimTime(Seconds(T));
+    rs.SetOutputDir(dir);
+    rs.SetRunTag("ntn-cho-tte-campaign-nr-replay");
+    if (sats.size() >= 2)
+    {
+        // X2 for TriggerHandover; the campaign's policy decides, not the vendored A3.
+        rs.SetHandover(true, 6.0, MilliSeconds(1024));
+        rs.SetAutonomousHandover(false);
+        rs.SetSsbCellBeam(true, nullptr);
+    }
+    rs.Build(gnbNodes, ueNodes);
+
+    // The helper attaches to the nearest gNB; align with the campaign's first
+    // serving satellite, then execute each of the policy's handovers.
+    uint32_t requested = 0;
+    uint32_t refused = 0;
+    auto issue = [&](double t, int32_t sat) {
+        const uint16_t cell = rs.GetGnbCellId(gnbOfSat[sat]);
+        Simulator::Schedule(Seconds(t), [&rs, cell, &requested, &refused]() {
+            if (rs.GetUeServingCellId(0) == cell)
+            {
+                return;
+            }
+            if (rs.TriggerHandover(0, cell))
+            {
+                ++requested;
+            }
+            else
+            {
+                ++refused;
+            }
+        });
+    };
+    if (sats.size() >= 2)
+    {
+        issue(0.2, servingAtStart);
+        for (const auto& [t, sat] : plan)
+        {
+            issue(std::max(0.3, t), sat);
+        }
+    }
+
+    // Downlink CBR with an in-band SeqTsSizeHeader (1024 B every 5 ms).
+    const uint16_t port = 4000;
+    ReplayFlow flow;
+    PacketSinkHelper sinkH("ns3::UdpSocketFactory", InetSocketAddress(Ipv4Address::GetAny(), port));
+    sinkH.SetAttribute("EnableSeqTsSizeHeader", BooleanValue(true));
+    ApplicationContainer sink = sinkH.Install(ueNodes.Get(0));
+    sink.Get(0)->TraceConnectWithoutContext("RxWithSeqTsSize", MakeCallback(&ReplayFlow::Rx, &flow));
+    CbrHelper cbr("ns3::UdpSocketFactory", InetSocketAddress(rs.GetUeIpv4Address(0), port));
+    cbr.SetConstantTraffic(MilliSeconds(5), 1024);
+    cbr.SetAttribute("EnableSeqTsSizeHeader", BooleanValue(true));
+    ApplicationContainer app = cbr.Install(rs.GetRemoteHost());
+    sink.Start(Seconds(0.0));
+    app.Start(Seconds(1.0));
+    app.Stop(Seconds(T - 0.5));
+    rs.AttachExternalDlFlow(0, app.Get(0), sink.Get(0), Seconds(1.0), Seconds(T - 0.5));
+
+    Simulator::Stop(Seconds(T));
+    Simulator::Run();
+    rs.Collect();
+    rs.WriteHealthReport();
+
+    const uint64_t sent = DynamicCast<CbrApplication>(app.Get(0))->GetSent() / 1024;
+    double maxGap = 0.0;
+    std::ofstream gapCsv(dir + "/nr_check.csv");
+    gapCsv << "kind,time_s,value\n";
+    for (const auto& [t, sat] : plan)
+    {
+        // The longest reception gap within 2 s after the decision.
+        double g = 0.0;
+        for (const auto& [rt, gap] : flow.gaps)
+        {
+            if (rt >= t && rt <= t + 2.0)
+            {
+                g = std::max(g, gap);
+            }
+        }
+        maxGap = std::max(maxGap, g);
+        gapCsv << "handover_gap_ms," << t << "," << g << "\n";
+    }
+    const double loss = sent > 0 ? 1.0 - static_cast<double>(flow.rx) / sent : 0.0;
+    gapCsv << "dl_sent_packets,," << sent << "\n"
+           << "dl_rx_packets,," << flow.rx << "\n"
+           << "dl_loss_ratio,," << loss << "\n"
+           << "dl_owd_mean_ms,," << (flow.rx ? flow.sumDelayMs / flow.rx : 0.0) << "\n"
+           << "dl_ipdv_mean_ms,," << (flow.ipdvN ? flow.ipdvSumMs / flow.ipdvN : 0.0) << "\n"
+           << "dl_sinr_db,," << rs.GetMeanDlSinrDb() << "\n"
+           << "dl_tbler,," << rs.GetMeanDlTbler() << "\n"
+           << "policy_handovers,," << plan.size() << "\n"
+           << "x2_handovers_requested,," << requested << "\n"
+           << "x2_handovers_refused,," << refused << "\n"
+           << "x2_handovers_completed,," << rs.GetHandoverCount() << "\n"
+           << "reestablishments_not_replayed,," << reestInWindow << "\n";
+    gapCsv << "window_start_s,," << t0 << "\n";
+    std::cout << "  nr replay (terminal 0, [" << t0 << ", " << t0 + T << "] s, " << sats.size()
+              << " gNB, policy "
+              << p.policy << "): handovers policy=" << plan.size() << " x2 requested=" << requested
+              << " completed=" << rs.GetHandoverCount() << " refused=" << refused
+              << " | DL sent=" << sent << " rx=" << flow.rx << " loss=" << loss
+              << " owd=" << (flow.rx ? flow.sumDelayMs / flow.rx : 0.0)
+              << " ms ipdv=" << (flow.ipdvN ? flow.ipdvSumMs / flow.ipdvN : 0.0)
+              << " ms max_ho_gap=" << maxGap << " ms sinr=" << rs.GetMeanDlSinrDb()
+              << " dB -> " << dir << "\n";
+    Simulator::Destroy();
+    return 0;
+}
+
 int
 main(int argc, char* argv[])
 {
@@ -1653,6 +2143,10 @@ main(int argc, char* argv[])
     cmd.AddValue("simTime", "simulated time (s)", p.simTime);
     cmd.AddValue("rngRun", "RNG run (seed index)", p.rngRun);
     cmd.AddValue("outputDir", "output directory", p.outputDir);
+    cmd.AddValue("nrCheckS",
+                 "Wave 7A: seconds of terminal 0's serving timeline replayed on a packet-level "
+                 "NR-NTN data plane after the campaign (campaign mode; 0 = off)",
+                 p.nrCheckS);
     cmd.AddValue("totalSats", "Walker T", p.totalSats);
     cmd.AddValue("numPlanes", "Walker P", p.numPlanes);
     cmd.AddValue("phasing", "Walker F", p.phasing);
@@ -1694,6 +2188,9 @@ main(int argc, char* argv[])
     cmd.AddValue("traceUe", "terminal index to trace at 1 s (-1 = none)", p.traceUe);
     cmd.AddValue("measFallback", "serving-floor fallback for the standardized conditions", p.measFallback);
     cmd.AddValue("tteRank", "rank the admitted candidates by predicted time to exit", p.tteRank);
+    cmd.AddValue("rankEntropy", "rank admitted candidates by entropy-weighted SINR and service time",
+                 p.rankEntropy);
+    cmd.AddValue("geoHysM", "hysteresis of the geodesic-distance condition (m)", p.geoHysM);
     cmd.AddValue("decisionPeriodS", "decision period (s); default = the 100 ms measurement period",
                  p.decisionPeriodS);
     cmd.AddValue("tteCacheS", "candidate prediction cache refresh (s); 0 = recompute always",
@@ -1711,6 +2208,11 @@ main(int argc, char* argv[])
                  "err_r_m,err_a_m,err_c_m); replaces the Gaussian draw", p.ephErrorFile);
     cmd.AddValue("ephAgeMinH", "N4: minimum element-set age (h) of the drawn samples", p.ephAgeMinH);
     cmd.AddValue("ephAgeMaxH", "N4: maximum element-set age (h), exclusive", p.ephAgeMaxH);
+    cmd.AddValue("ageSigmaTable", "CSV of one-sigma RTN error by element-set age bin", p.ageSigmaTable);
+    cmd.AddValue("marginByAge", "tte-cho margin budgets each satellite by its age bin (needs ageSigmaTable)",
+                 p.marginByAge);
+    cmd.AddValue("ephGaussByAge", "Gaussian copy error with the sigmas of a drawn age bin (needs ageSigmaTable)",
+                 p.ephGaussByAge);
     cmd.AddValue("reestBaseMs", "re-establishment base time (ms), before the RACH over the slant", p.reestBaseMs);
     cmd.AddValue("classEnv", "R2: per-class environment (aircraft/ship LOS, train rural)", p.classEnv);
     cmd.AddValue("losModel", "R2: LOS-state process, redraw | markov", p.losModel);
@@ -1736,6 +2238,35 @@ main(int argc, char* argv[])
     cmd.Parse(argc, argv);
     NS_ABORT_MSG_IF(p.losModel != "redraw" && p.losModel != "markov", "unknown --losModel");
     NS_ABORT_MSG_IF(p.ephModel != "propagated" && p.ephModel != "offset", "unknown --ephModel");
+    if (!p.ageSigmaTable.empty())
+    {
+        std::ifstream at(p.ageSigmaTable);
+        NS_ABORT_MSG_IF(!at.good(), "cannot read --ageSigmaTable " << p.ageSigmaTable);
+        std::string line;
+        std::getline(at, line); // header
+        while (std::getline(at, line))
+        {
+            std::stringstream ss(line);
+            std::string f[6];
+            for (int k = 0; k < 6 && std::getline(ss, f[k], ','); ++k)
+            {
+            }
+            if (f[5].empty())
+            {
+                continue;
+            }
+            g_ageTable.push_back({std::stod(f[0]), std::stod(f[1]), std::stod(f[2]),
+                                  Vector(std::stod(f[3]), std::stod(f[4]), std::stod(f[5]))});
+        }
+        NS_ABORT_MSG_IF(g_ageTable.empty(), "empty --ageSigmaTable");
+    }
+    // the margin by age is a property of the exit-triggered margin rule only
+    NS_ABORT_MSG_IF(p.marginByAge && (p.policy != "tte-cho" || g_ageTable.empty()),
+                    "--marginByAge needs --policy=tte-cho and --ageSigmaTable");
+    g_marginByAge = p.marginByAge;
+    NS_ABORT_MSG_IF(p.ephGaussByAge && g_ageTable.empty(), "--ephGaussByAge needs --ageSigmaTable");
+    NS_ABORT_MSG_IF(p.ephGaussByAge && (!p.tleTruthFile.empty() || !p.ephErrorFile.empty()),
+                    "--ephGaussByAge is a synthetic-shell error model");
 
     if (!p.ephErrorFile.empty())
     {
@@ -1757,7 +2288,7 @@ main(int argc, char* argv[])
     {
         p.assumedSigmaCrossM = p.ephSigmaCrossM;
     }
-    const std::set<std::string> policies{"a3", "d2", "t1", "elev", "tte-eager", "mst", "tte-cho"};
+    const std::set<std::string> policies{"a3", "d2", "t1", "elev", "tte-eager", "mst", "tte-cho", "geo"};
     NS_ABORT_MSG_IF(policies.count(p.policy) == 0, "unknown --policy " << p.policy);
 
     RngSeedManager::SetSeed(1);
@@ -1845,6 +2376,9 @@ main(int argc, char* argv[])
             }
             g_sats.push_back(mt);
             tleNet.push_back(mn);
+            KeplerianElements kn;
+            nr.ToKeplerian(kn);
+            g_satAge0H.push_back((tleStartUnix - kn.epoch_unix_s) / 3600.0);
         }
     }
     else
@@ -1981,7 +2515,15 @@ main(int argc, char* argv[])
     ephPick->SetStream(3100);
     std::ofstream ephLog;
     const bool anyGauss = p.ephSigmaRadialM > 0.0 || p.ephSigmaAlongM > 0.0 || p.ephSigmaCrossM > 0.0;
-    g_ephActive = tleMode || anyGauss || !ephRows.empty();
+    g_ephActive = tleMode || anyGauss || !ephRows.empty() || p.ephGaussByAge;
+    Ptr<UniformRandomVariable> agePick;
+    if (p.ephGaussByAge)
+    {
+        // own stream, so every other draw is unchanged by the age model
+        agePick = CreateObject<UniformRandomVariable>();
+        agePick->SetStream(3200);
+        g_satAge0H.assign(g_sats.size(), 0.0);
+    }
     if (g_ephActive)
     {
         if (!ephLog.is_open())
@@ -1999,6 +2541,30 @@ main(int argc, char* argv[])
         double ea = p.ephSigmaAlongM * ephDraw->GetValue();
         double ec = p.ephSigmaCrossM * ephDraw->GetValue();
         double rate = 0.0;
+        if (p.ephGaussByAge)
+        {
+            // an age bin with probability n / N, the age uniform inside it
+            // (24 to 48 h for the open bin), and the bin's sigmas for the draw
+            double tot = 0.0;
+            for (const auto& b : g_ageTable)
+            {
+                tot += b.n;
+            }
+            double x = agePick->GetValue(0.0, tot);
+            size_t k = 0;
+            while (k + 1 < g_ageTable.size() && x >= g_ageTable[k].n)
+            {
+                x -= g_ageTable[k].n;
+                ++k;
+            }
+            const auto& b = g_ageTable[k];
+            const double hi = std::min(b.hi, b.lo + 24.0);
+            g_satAge0H[s] = agePick->GetValue(b.lo, hi);
+            const Vector sg = AgeSigmaOf(static_cast<uint32_t>(s));
+            er = sg.x * ephDraw->GetValue();
+            ea = sg.y * ephDraw->GetValue();
+            ec = sg.z * ephDraw->GetValue();
+        }
         if (!ephRows.empty())
         {
             const uint32_t k = ephPick->GetInteger(0, static_cast<uint32_t>(ephRows.size() - 1));
@@ -2062,6 +2628,22 @@ main(int argc, char* argv[])
         std::cout << "eph-check: model=" << (tleMode ? "tle" : p.ephModel) << " " << ephRows.size()
                   << " file rows, max |copy - true - drawn RTN| at t=0 = " << ephCheckMax << " m\n";
     }
+    if (g_marginByAge || p.ephGaussByAge)
+    {
+        // the element-set age of every satellite and the sigmas it is budgeted with at t = 0
+        NS_ABORT_MSG_IF(g_satAge0H.size() != g_sats.size(), "no element-set age for some satellites");
+        std::ofstream al(p.outputDir + "/sat_ages.csv");
+        al << "sat,age0_h,sig_r_m,sig_a_m,sig_c_m\n";
+        for (size_t s = 0; s < g_sats.size(); ++s)
+        {
+            const Vector sg = AgeSigmaOf(static_cast<uint32_t>(s));
+            al << s << "," << std::setprecision(6) << g_satAge0H[s] << "," << sg.x << "," << sg.y
+               << "," << sg.z << "\n";
+        }
+        std::cout << "age-margin: " << g_ageTable.size() << " bins, margin by age "
+                  << (g_marginByAge ? "on" : "off") << ", Gaussian by age "
+                  << (p.ephGaussByAge ? "on" : "off") << ", z " << p.marginZ << "\n";
+    }
     for (int env = 0; env < 4; ++env)
     {
         g_tteEnv[env] = CreateObject<NtnTteEstimator>();
@@ -2093,6 +2675,7 @@ main(int argc, char* argv[])
         UeCtx& u = g_ues[i];
         u.node = ueNodes.Get(i);
         u.mob = ueMobs[i];
+        u.startPos = u.mob->GetPosition();
         u.ueClass = u.mob->GetClassName();
         u.env = baseEnv;
         if (p.classEnv && baseEnv != kEnvLos)
@@ -2145,6 +2728,14 @@ main(int argc, char* argv[])
             c.ephSigmaAlongM = p.assumedSigmaAlongM;
             c.ephSigmaCrossM = p.assumedSigmaCrossM;
         }
+        else if (p.policy == "geo")
+        {
+            // The algorithm's own condition never fires; the geodesic condition
+            // is evaluated in Decide().
+            c.triggerType = NtnChoAlgorithm::TRIGGER_EVENT_A3;
+            c.a3Offset_dB = 1e3;
+            c.a3TimeToTrigger = MilliSeconds(0);
+        }
         else if (p.policy == "elev")
         {
             c.triggerType = NtnChoAlgorithm::TRIGGER_ELEVATION;
@@ -2169,6 +2760,10 @@ main(int argc, char* argv[])
             }
         }
         u.cho->Configure(c);
+        if (g_marginByAge)
+        {
+            u.cho->SetEphSigmaProvider(MakeCallback(&AgeSigmaOf));
+        }
         // Decisions are actuated by this scenario's own execution model.
         u.cho->SetHandoverExecutionCallback(MakeCallback(+[](uint16_t, uint16_t) {}));
     }
@@ -2337,6 +2932,12 @@ main(int argc, char* argv[])
               << " outage=" << 100.0 * sumOut / (p.numUes * p.simTime) << "% meanSINR="
               << (nSamp ? sumSinr / nSamp : 0.0) << " dB meanToS=" << meanTos
               << " s wall=" << wall << " s\n";
+    // Terminal 0's start position, read before the clock is reset.
+    Vector ue0Start = g_ues.empty() ? Vector() : g_ues[0].startPos;
     Simulator::Destroy();
+    if (p.nrCheckS > 0.0 && !g_ues.empty())
+    {
+        return RunNrReplay(p, ue0Start);
+    }
     return 0;
 }

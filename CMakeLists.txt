@@ -2,8 +2,11 @@ set(source_files
     model/ntn-orbit-predictor.cc
     model/ntn-tte-estimator.cc
     model/ntn-cho-algorithm.cc
+    model/ntn-cho-cond-event-ie.cc
     model/ntn-measurement-model.cc
     model/ntn-ai-interface.cc
+    # P0-3: handover KPIs measured from the UE RRC traces and packet arrivals.
+    model/ntn-ho-kpi-recorder.cc
     # Real 3GPP TR 38.811 UE-class mobility as an ns-3 MobilityModel (ECEF,
     # SGP4-compatible) -- the toolkit's core NTN UE mobility architecture.
     model/ntn-tr38811-mobility-model.cc
@@ -18,8 +21,10 @@ set(header_files
     model/ntn-orbit-predictor.h
     model/ntn-tte-estimator.h
     model/ntn-cho-algorithm.h
+    model/ntn-cho-cond-event-ie.h
     model/ntn-measurement-model.h
     model/ntn-ai-interface.h
+    model/ntn-ho-kpi-recorder.h
     model/ntn-tr38811-mobility-model.h
     model/ntn-geodetic-fixed-mobility-model.h
     helper/ntn-cho-helper.h
@@ -29,6 +34,7 @@ set(header_files
 set(test_sources
     test/ntn-cho-test-suite.cc
     test/ntn-standards-validation-test.cc
+    test/ntn-cho-depth-test.cc
 )
 
 # ns3-ai is an OPTIONAL dependency: only NtnAiInterface (the learning-based
@@ -65,4 +71,10 @@ build_lib(
 
 if(ntn_cho_optional_libs)
   target_compile_definitions(${libntn-cho} PRIVATE NTN_CHO_HAS_NS3AI)
+endif()
+
+# The depth tests run the KPI recorder on real NR handovers (NtnRealStackHelper,
+# ntn-traffic). Only the test library links it.
+if(TARGET ntn-cho-test)
+  target_link_libraries(ntn-cho-test ntn-traffic)
 endif()

@@ -66,18 +66,6 @@ this module. Inside `ns3-ntn-toolkit` both modules are already in
 `contrib/`; on a vanilla ns-3.43 tree, clone them from the toolkit into
 `contrib/ntn-traffic` and `contrib/ntn-constellation`.
 
-The campaign example `ntn-cho-tte-campaign` additionally needs
-`Sgp4MobilityModel::SetSimulationEpochUnix`, which anchors satellites loaded
-from real element sets (its real-shell mode, `--tleTruthFile`/`--tleNetFile`)
-to one simulation epoch. `ntn-constellation` has it from toolkit commit
-8d395304a. On an older copy, apply the patch shipped here from the ns-3 root
-and reconfigure; until then CMake prints a warning and skips that one example:
-
-```bash
-git apply contrib/ntn-cho/patches/ntn-constellation-sgp4-simulation-epoch.patch
-./ns3 configure --enable-examples
-```
-
 ### 2c. mmWave NR PHY (REQUIRED for the examples)
 
 The same examples run real mmwave NR cells, so `contrib/mmwave` (and its
