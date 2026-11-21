@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ntn-cho-framework: LEO conditional handover in ns-3</title>
+<meta name="description" content="ns-3 module for LEO conditional handover: time-to-exit estimation from propagated orbits plus the TS 38.331 A3, D1, D2 and T1 trigger classes.">
+<link rel="canonical" href="https://muhammaduazir69.github.io/ntn-cho-framework/">
+<meta property="og:type" content="website"><meta property="og:title" content="ntn-cho-framework: LEO conditional handover in ns-3">
+<meta property="og:description" content="ns-3 module for LEO conditional handover: time-to-exit estimation from propagated orbits plus the TS 38.331 A3, D1, D2 and T1 trigger classes."><meta property="og:url" content="https://muhammaduazir69.github.io/ntn-cho-framework/">
+<meta property="og:image" content="https://muhammaduazir69.github.io/ntn-cho-framework/banner.jpg"><meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Roboto+Condensed:wght@400;700&family=Roboto+Mono&family=Roboto:wght@300;400;500;700&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#f7f7fa;--fg:#14151c;--mut:#555a6e;--card:#fff;--line:#e3e5ee;--acc:#3a24d6;--acc2:#6a10d5;--wash:#eeeaff;--code:#101218;--codefg:#e6e8f0}
+@media (prefers-color-scheme:dark){:root{--bg:#0d0f16;--fg:#eceef6;--mut:#a3a8bd;--card:#161927;--line:#272b3d;--acc:#8fa8ff;--acc2:#b59cff;--wash:#1c1e42;--code:#07080c}}
+*{box-sizing:border-box}html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--fg);font:400 17px/1.6 Roboto,system-ui,sans-serif}
+a{color:var(--acc)}h1,h2,h3{font-family:"Roboto Condensed",sans-serif;line-height:1.1}
+.top{position:sticky;top:0;z-index:20;background:#141414;color:#fff;display:flex;align-items:center;justify-content:space-between;padding:0 24px;height:56px}
+.top b{font:700 22px "Roboto Condensed";letter-spacing:1px}.top nav a{color:#cfd6ff;text-decoration:none;margin-left:18px;font-size:15px}
+.top nav a:hover{color:#fff}.top .lv{font-family:"Roboto Mono";color:#aab8ff}
+.hero{position:relative;overflow:hidden;color:#fff;background:linear-gradient(100deg,#1238d8,#3424d6 48%,#6a10d5)}
+.hero .bgfig{position:absolute;inset:-60px;background:url(fig.png) center/cover no-repeat;opacity:.16;filter:blur(1.5px) saturate(.4);
+ transform:translate3d(0,0,0) scale(1.05);transition:transform .25s ease-out;mix-blend-mode:screen}
+.hero .in{position:relative;max-width:1180px;margin:0 auto;padding:64px 24px 84px;display:grid;grid-template-columns:1fr 1.25fr;gap:44px;align-items:center}
+.kick{font:700 14px "Roboto Condensed";letter-spacing:3px;text-transform:uppercase;color:#d6dcff}
+.hero h1{font-size:clamp(40px,6vw,68px);margin:10px 0 6px}.hero .sub{font-size:21px;color:#eef0ff;margin:0 0 6px}
+.hero .lead{color:#dfe3ff;font-size:16px;margin:12px 0 22px}
+.btns{display:flex;flex-wrap:wrap;gap:10px}.btn{display:inline-flex;align-items:center;gap:8px;padding:10px 16px;border-radius:999px;
+ text-decoration:none;font-weight:500;font-size:15px;border:1px solid #ffffff66;color:#fff;background:#ffffff1a;transition:transform .15s,background .15s}
+.btn:hover{transform:translateY(-2px);background:#ffffff33}.btn.pri{background:#fff;color:#3a1fc4;border-color:#fff}
+.figcard{margin:0;background:#fff;border-radius:16px;padding:12px;box-shadow:0 24px 60px #0a0a3a77;cursor:zoom-in;transition:transform .3s,box-shadow .3s;
+ transform:perspective(1200px) rotateY(0) rotateX(0)}
+.figcard:hover{box-shadow:0 30px 80px #0a0a3a99}.figcard img{width:100%;display:block;border-radius:8px}
+.figcard figcaption{color:#4b4f63;font-size:13px;text-align:center;padding:8px 4px 2px}
+.wave{position:absolute;left:0;right:0;bottom:-1px;width:100%;height:46px}
+main{max-width:1180px;margin:0 auto;padding:10px 24px 40px}
+section{padding:34px 0;border-bottom:1px solid var(--line)}section h2{font-size:32px;margin:0 0 14px}
+.study{background:var(--wash);border-radius:12px;padding:14px 18px;font-size:16px}.study span{display:block;font:700 13px "Roboto Condensed";letter-spacing:2px;text-transform:uppercase;color:var(--acc)}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:14px}
+.kn{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px}.kn b{font:700 28px "Roboto Condensed";color:var(--acc)}
+.kn p{margin:6px 0;font-weight:500}.kn small{color:var(--mut);font-size:13px;line-height:1.45;display:block}
+table{width:100%;border-collapse:collapse;background:var(--card);border-radius:12px;overflow:hidden;font-size:15px}
+td{padding:10px 14px;border-bottom:1px solid var(--line);vertical-align:top}td:first-child{font-weight:500;white-space:nowrap}
+.feat{display:block;text-decoration:none;color:var(--fg);background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px;transition:transform .2s,border-color .2s}
+.feat:hover{transform:translateY(-4px);border-color:var(--acc)}.feat b{font:700 21px "Roboto Condensed"}.feat p{color:var(--mut);font-size:15px;margin:6px 0 10px}
+.feat span{color:var(--acc);font-weight:500;font-size:14px}
+pre{position:relative;background:var(--code);color:var(--codefg);padding:16px 18px;border-radius:12px;overflow:auto;font:14px/1.55 "Roboto Mono",monospace}
+.cp{position:absolute;top:8px;right:8px;background:#ffffff1f;color:#fff;border:0;border-radius:8px;padding:5px 10px;cursor:pointer;font-size:12px}
+.video{position:relative;max-width:760px;aspect-ratio:16/9;border-radius:14px;overflow:hidden;cursor:pointer;background:#000 url(https://img.youtube.com/vi/JNStiBst68I/maxresdefault.jpg) center/cover}
+.video::after{content:"";position:absolute;left:50%;top:50%;width:76px;height:54px;margin:-27px 0 0 -38px;border-radius:14px;background:#e00 url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M9 7l8 5-8 5z' fill='white'/%3E%3C/svg%3E") center/34px no-repeat}
+.video iframe{position:absolute;inset:0;width:100%;height:100%;border:0}
+.links{display:flex;flex-wrap:wrap;gap:10px}.links a{padding:9px 14px;border-radius:10px;border:1px solid var(--line);background:var(--card);text-decoration:none;color:var(--fg);font-weight:500;font-size:15px}
+.links a:hover{border-color:var(--acc);color:var(--acc)}
+footer{text-align:center;color:var(--mut);font-size:14px;padding:30px 16px 40px}
+.lb{position:fixed;inset:0;z-index:50;background:#06071099;backdrop-filter:blur(4px);display:none;align-items:center;justify-content:center;overflow:hidden;cursor:grab}
+.lb.on{display:flex}.lb img{max-width:94vw;max-height:88vh;background:#fff;border-radius:10px;transform-origin:center;user-select:none;-webkit-user-drag:none}
+.lb .hint{position:fixed;bottom:16px;left:0;right:0;text-align:center;color:#dfe3ff;font-size:14px}.lb .x{position:fixed;top:14px;right:18px;color:#fff;font-size:34px;background:none;border:0;cursor:pointer}
+.reveal{opacity:0;transform:translateY(14px);transition:opacity .5s,transform .5s}.reveal.vis{opacity:1;transform:none}
+@media (prefers-reduced-motion:reduce){.reveal{opacity:1;transform:none;transition:none}.hero .bgfig,.figcard{transition:none}}
+@media (max-width:860px){.hero .in{grid-template-columns:1fr;padding:40px 16px 70px}.top nav a:not(.lv){display:none}main{padding:0 16px 30px}td:first-child{white-space:normal}}
+</style></head>
+<body>
+<div class="top"><b>6G NTN</b><nav><a href="#about">About</a><a href="#live">6g-ntn.live</a><a href="#install">Install</a><a href="#cite">Cite</a><a class="lv" href="https://6g-ntn.live">6g-ntn.live</a></nav></div>
+<header class="hero" id="hero"><div class="bgfig" id="bgfig"></div>
+<div class="in"><div>
+<div class="kick">ns3-ntn-toolkit module</div><h1>ntn-cho-framework</h1><p class="sub">LEO conditional handover with time to exit in ns-3</p>
+<p class="lead">ns-3 module for LEO conditional handover: time-to-exit estimation from propagated orbits plus the TS 38.331 A3, D1, D2 and T1 trigger classes.</p>
+<div class="btns"><a class="btn pri" href="https://6g-ntn.live/module/ntn-cho">Run it live at 6g-ntn.live</a><a class="btn" href="https://github.com/Muhammaduazir69/ntn-cho-framework">GitHub</a>
+<a class="btn" href="https://muhammaduazir69.github.io/ns3-ntn-toolkit/modules/ntn-cho/">Documentation</a><a class="btn" href="https://github.com/Muhammaduazir69/ntn-cho-framework/releases/tag/v2.7.1">Release v2.7.1</a><a class="btn" href="https://youtu.be/JNStiBst68I">Watch the demo</a></div>
+</div>
+<figure class="figcard" id="figcard" tabindex="0" role="button" aria-label="Zoom the figure"><img src="fig.png" alt="Fig. 1 of the accompanying study: the system model. Click to zoom."><figcaption>Fig. 1 of the accompanying study: the system model. Click to zoom.</figcaption></figure>
+</div>
+<svg class="wave" viewBox="0 0 1600 46" preserveAspectRatio="none"><path d="M0 30 C400 6 800 46 1600 14 L1600 46 L0 46 Z" fill="var(--bg)"/></svg>
+</header>
+<main>
+<section id="about" class="reveal"><h2>What ntn-cho-framework does</h2><p>ntn-cho is an ns-3 module for conditional handover (CHO) in LEO non-terrestrial networks that estimates each candidate satellite&#x27;s time to exit from propagated orbits and conditions the handover decision on it. It also implements the 3GPP TS 38.331 CondEvent A3, D1, T1 and Rel-18 D2 triggers, plus elevation and timing-advance mechanisms from TR 38.821, each evaluated against live geometry.</p><p class="study"><span>Accompanying study</span>Conditional Handover in LEO Satellite Networks Under Ephemeris Error: Handover-Rate Analysis and Exit-Error Propagation. Code and data are in this repository.</p></section>
+<section class="reveal"><h2>What it models</h2><p>A LEO cell moves away from its users, so the neighbor that looks best now may be about to set. ntn-cho estimates time to exit (TTE), how long a candidate remains serviceable, by a coarse forward scan over the propagated orbit followed by a binary search for the beam-exit instant. With a line-of-sight probability table it also returns the expected usable time to exit, and it propagates an injected RTN ephemeris error into a first-order sigma of the exit time. The Rel-17 CHO state machine runs from idle through preparation, condition monitoring and execution to completion. Its trigger classes are 3GPP TS 38.331 CondEvent A3, D1 on a fixed reference location, T1 on an absolute window, Rel-18 D2 on a moving ephemeris reference (Section 5.5.4.15a), elevation and timing advance as studied in 3GPP TR 38.821, TTE-aware selection, Rel-19 conditional LTM and trajectory-predictive CHO, with optional RACH-less execution from timing-advance pre-compensation.</p><p>UEs move according to the 3GPP TR 38.811 Section 6.1.1.1 classes (handheld, pedestrian, vehicular, HST, maritime, aviation, fixed IoT) in ECEF, and a measurement model gives TR 38.811 RSRP, SINR and signed Doppler. In the real-stack examples the algorithm decides on the measured SINR of an NR NTN cell. CHO is modeled at the decision and timing level: there is no over-the-air conditional reconfiguration PDU, and the RACH interruption is priced as slant round trip plus processing. Trigger-decided and fallback-decided handovers are counted separately, so the CHO layer is not credited with a cell change the radio would have made anyway.</p></section>
+<section><h2 class="reveal">Measured numbers</h2><div class="grid"><div class="kn reveal"><b>134.6 ± 11.6 handovers per run</b><p>Handovers per run of the TTE-aware policy (A3 RSRP baseline: 463.3 ± 47.8)</p><small>ntn-cho-full-constellation, ten seeds per policy, 66 satellites (6 planes x 11) at 780 km and 86.4 deg, 30 UEs, 600 s, suburban; Student-t 95 % half-width; runs from April 2026 that predate later fixes to the module</small></div><div class="kn reveal"><b>83.14 ± 4.59 %</b><p>Handover success of the TTE-aware policy, with 0.00 % ping-pong</p><small>Same ten-seed ntn-cho-full-constellation runs as above</small></div><div class="kn reveal"><b>98.69 ± 0.48 %</b><p>Handover success of location-based (D1) CHO, with 57.07 ± 3.26 % ping-pong</p><small>Same ten-seed ntn-cho-full-constellation runs as above</small></div><div class="kn reveal"><b>69.16 ± 3.06 %</b><p>Handover success of the A3 RSRP baseline, with 50.23 ± 2.51 % ping-pong</p><small>Same ten-seed ntn-cho-full-constellation runs as above</small></div><div class="kn reveal"><b>8 s / 69 s / 81 s / 125 s / 248 s</b><p>Firing times of D2 and TA / D1 / A3 / T1 / elevation triggers</p><small>Shipped two-cell pass; elevation fired when the serving satellite reached the 10 degree floor</small></div><div class="kn reveal"><b>about 1932 km</b><p>Slant range at 10 deg elevation checked by the ntn-standards-validation suite</p><small>LEO-600 (TR 38.821 reference), spherical-Earth elevation and slant relation</small></div></div>
+<p style="color:var(--mut);font-size:14px">Each number states the run it comes from; the README of the module lists the command that reproduces it.</p></section>
+<section class="reveal"><h2>Standards it follows</h2><table><tr><td>3GPP TS 38.331</td><td>Conditional reconfiguration and CondEvent A3, A4, D1, D2, T1; SIB19</td></tr><tr><td>3GPP TS 38.300</td><td>Handover procedure</td></tr><tr><td>3GPP TS 38.133</td><td>Measurement</td></tr><tr><td>3GPP TS 38.321</td><td>Random access</td></tr><tr><td>3GPP TR 38.821</td><td>NTN mobility, interruption budget, Set-1; elevation and timing-advance mechanisms as study items</td></tr><tr><td>3GPP TR 38.811</td><td>UE mobility classes (Section 6.1.1.1) and NTN channel scenarios for RSRP and SINR</td></tr></table></section>
+<section id="live"><h2 class="reveal">New on 6g-ntn.live</h2>
+<p class="reveal">The toolkit now runs in the browser at <a href="https://6g-ntn.live">6g-ntn.live</a>: pick an example of ntn-cho-framework or any other module, change its parameters, and the real ns-3 binary runs on the server.</p>
+<div class="grid"><a class="feat reveal" href="https://6g-ntn.live/console"><b>Live ns-3 console</b><p>Type ./ns3 run with your own arguments; the real binary runs on the server and streams its output.</p><span>Open &rarr;</span></a><a class="feat reveal" href="https://6g-ntn.live/examples"><b>115 runnable examples</b><p>Every example of the 14 modules, each with a typed parameter form and its measured KPIs.</p><span>Open &rarr;</span></a><a class="feat reveal" href="https://6g-ntn.live/globe"><b>Live 3D globe</b><p>Real constellations from CelesTrak elements, propagated with SGP4, with their service and feeder links.</p><span>Open &rarr;</span></a><a class="feat reveal" href="https://6g-ntn.live/datasets"><b>Open datasets</b><p>Every finished run becomes a dataset under CC BY 4.0, with its provenance and configuration.</p><span>Open &rarr;</span></a><a class="feat reveal" href="https://6g-ntn.live/validation"><b>Validation</b><p>690 test cases in 41 toolkit suites, and a health check on every example.</p><span>Open &rarr;</span></a><a class="feat reveal" href="https://6g-ntn.live/scenarios"><b>Shared scenarios</b><p>Researchers post a configuration with its parameters and results; anyone can rerun it.</p><span>Open &rarr;</span></a></div></section>
+<section class="reveal"><h2>Watch</h2><div class="video" id="video" role="button" aria-label="Play the 5-minute demo on YouTube" tabindex="0"></div>
+<p><a href="https://youtu.be/JNStiBst68I">Watch on YouTube</a>: the NTN Control Center running and visualizing the toolkit examples, in five minutes.</p></section>
+<section id="install" class="reveal"><h2>Install</h2>
+<p>Every module ships in the ready-built container image of the toolkit (version 2.7.1):</p>
+<pre><code>docker pull uzairdocker69/ns3-ntn-toolkit:latest
+docker run --rm -it uzairdocker69/ns3-ntn-toolkit:latest bash</code></pre>
+<p>To build from source, clone <a href="https://github.com/Muhammaduazir69/ns3-ntn-toolkit">ns3-ntn-toolkit</a>, which vendors this module under <code>contrib/</code>, or follow <a href="https://github.com/Muhammaduazir69/ntn-cho-framework#readme">the README of this repository</a> (branch <code>main</code>).</p></section>
+<section id="cite" class="reveal"><h2>Cite</h2><p>If you use ntn-cho-framework, please cite the toolkit article (<a href="https://doi.org/10.1109/OJCOMS.2026.3745010">doi:10.1109/OJCOMS.2026.3745010</a>):</p>
+<pre><code>@article{uzair2026ns3ntntoolkit,
+  author  = {Uzair, Muhammad and Aldahlan, Bassma G. and Albar, Ali A. and
+             Althumali, Huda and Alghammas, Adnan},
+  title   = {ns3-ntn-toolkit: An Integrated ns-3 Platform for 6G
+             Non-Terrestrial Networks},
+  journal = {IEEE Open Journal of the Communications Society},
+  volume  = {7},
+  pages   = {13440--13467},
+  year    = {2026},
+  doi     = {10.1109/OJCOMS.2026.3745010}
+}</code></pre></section>
+<section class="reveal"><h2>Links</h2><div class="links">
+<a href="https://6g-ntn.live">6g-ntn.live</a><a href="https://github.com/Muhammaduazir69/ntn-cho-framework">GitHub: ntn-cho-framework</a><a href="https://github.com/Muhammaduazir69/ntn-cho-framework/releases/tag/v2.7.1">Latest release (v2.7.1)</a><a href="https://github.com/Muhammaduazir69/ns3-ntn-toolkit">ns3-ntn-toolkit</a>
+<a href="https://muhammaduazir69.github.io/ns3-ntn-toolkit/modules/ntn-cho/">Documentation</a><a href="https://hub.docker.com/r/uzairdocker69/ns3-ntn-toolkit">Docker Hub</a><a href="https://youtu.be/JNStiBst68I">YouTube</a><a href="https://www.linkedin.com/in/muhammad-uzair-285331185/">LinkedIn</a><a href="https://orcid.org/0009-0002-4104-2680">ORCID</a></div></section>
+</main>
+<footer>Muhammad Uzair, Independent Researcher &middot; <a href="https://www.linkedin.com/in/muhammad-uzair-285331185/">LinkedIn</a> &middot; <a href="https://orcid.org/0009-0002-4104-2680">ORCID</a> &middot; <a href="https://6g-ntn.live">6g-ntn.live</a><br>GPL-2.0 code; datasets on 6g-ntn.live under CC BY 4.0.</footer>
+<div class="lb" id="lb" aria-hidden="true"><button class="x" id="lbx" aria-label="Close">&times;</button><img id="lbimg" src="fig.png" alt="Fig. 1 of the accompanying study: the system model. Click to zoom."><div class="hint">Scroll to zoom, drag to pan, double-click to reset, Esc to close</div></div>
+<script>
+(function(){
+ var rm=matchMedia('(prefers-reduced-motion: reduce)').matches, bg=document.getElementById('bgfig'), card=document.getElementById('figcard'), hero=document.getElementById('hero');
+ if(!rm){hero.addEventListener('pointermove',function(ev){var r=hero.getBoundingClientRect(),x=(ev.clientX-r.left)/r.width-.5,y=(ev.clientY-r.top)/r.height-.5;
+  bg.style.transform='translate3d('+(-x*30)+'px,'+(-y*20)+'px,0) scale(1.08)';card.style.transform='perspective(1200px) rotateY('+(x*6)+'deg) rotateX('+(-y*5)+'deg)';});
+  hero.addEventListener('pointerleave',function(){bg.style.transform='';card.style.transform='';});
+  addEventListener('scroll',function(){bg.style.backgroundPositionY='calc(50% + '+(scrollY*.25)+'px)';},{passive:true});}
+ var io=new IntersectionObserver(function(es){es.forEach(function(x){if(x.isIntersecting){x.target.classList.add('vis');io.unobserve(x.target);}});},{threshold:.12});
+ document.querySelectorAll('.reveal').forEach(function(n){io.observe(n);});
+ var lb=document.getElementById('lb'),im=document.getElementById('lbimg'),s=1,tx=0,ty=0,drag=null;
+ function ap(){im.style.transform='translate('+tx+'px,'+ty+'px) scale('+s+')';}
+ function open(){lb.classList.add('on');lb.setAttribute('aria-hidden','false');s=1;tx=ty=0;ap();}
+ function close(){lb.classList.remove('on');lb.setAttribute('aria-hidden','true');}
+ card.addEventListener('click',open);card.addEventListener('keydown',function(k){if(k.key==='Enter'||k.key===' ')open();});
+ document.getElementById('lbx').addEventListener('click',close);addEventListener('keydown',function(k){if(k.key==='Escape')close();});
+ lb.addEventListener('wheel',function(w){w.preventDefault();s=Math.min(6,Math.max(1,s*(w.deltaY<0?1.15:1/1.15)));if(s===1){tx=ty=0;}ap();},{passive:false});
+ lb.addEventListener('pointerdown',function(p){if(p.target===lb){close();return;}drag=[p.clientX-tx,p.clientY-ty];});
+ addEventListener('pointermove',function(p){if(drag){tx=p.clientX-drag[0];ty=p.clientY-drag[1];ap();}});addEventListener('pointerup',function(){drag=null;});
+ im.addEventListener('dblclick',function(){s=s>1?1:2.5;tx=ty=0;ap();});
+ var v=document.getElementById('video');function play(){v.innerHTML='<iframe src="https://www.youtube-nocookie.com/embed/JNStiBst68I?autoplay=1" title="NTN Control Center demo" allow="autoplay; encrypted-media; picture-in-picture" allowfullscreen></iframe>';v.style.cursor='default';v.onclick=null;}
+ v.onclick=play;v.addEventListener('keydown',function(k){if(k.key==='Enter')play();});
+ document.querySelectorAll('pre').forEach(function(p){var b=document.createElement('button');b.className='cp';b.textContent='Copy';
+  b.onclick=function(){navigator.clipboard.writeText(p.innerText.replace(/Copy$/,'').trim()).then(function(){b.textContent='Copied';setTimeout(function(){b.textContent='Copy';},1400);});};p.appendChild(b);});
+})();
+</script>
+</body></html>
